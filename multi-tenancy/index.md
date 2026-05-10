@@ -7,7 +7,7 @@ has_children: false
 # Multi-tenancy
 {: .no_toc }
 
-**Status:** Draft V2 V2
+**Status:** Draft V3 V2
 
 This chapter is about how one shared PHP worker serves dozens of customers without knowing which one is which, and how each customer's choice of AI provider, model, and key gets resolved at runtime without polluting the worker code with customer-specific branches. The IBM i platform makes this easier than it would be on most stacks — library lists do most of the work — but there are real decisions to make about where shared admin data lives and how customer profiles are looked up.
 
@@ -128,6 +128,10 @@ A profile reference looks something like `ACME_DEFAULT`, `ACME_FAST`, `ACME_BUDG
 A few notes:
 
 **`PROFILE_REF` is the primary key, customer + name is a unique index.** This lets RPG send a stable reference that doesn't change when a profile gets renamed in admin UI, while also letting humans browse profiles by customer and name.
+
+**`PROFILE_REF` is globally unique by convention.** The convention is `<CUSTOMER>_<PROFILE_NAME>` — for example, `ACME_DEFAULT`, `BARCO_DEFAULT`. This is why ACME's "DEFAULT" and BARCO's "DEFAULT" don't collide on the primary key — they're stored as `ACME_DEFAULT` and `BARCO_DEFAULT`. The schema doesn't *enforce* this convention; an admin tool inserting bare names without the customer prefix would compile but produce confusing collisions and look-up failures. If your insertion paths are anything other than carefully-controlled admin UI, consider adding a CHECK constraint that `PROFILE_REF LIKE CUSTOMER || '\_%'`. For V1, the convention is documented and trusted.
+
+An alternative — making the primary key `(CUSTOMER, PROFILE_REF)` — is also defensible. We chose single-column PK so RPG can send just the ref without also sending customer (the request envelope already includes customer for other reasons; it's redundant on the lookup). Either design works; pick whichever fits your shop's habits.
 
 **`MODE` is one character because it's hot.** Read on every request. `'B'` for bring-your-own-key, `'H'` for K3S-hosted. The full word is unnecessary at the cost of a tiny readability hit in raw SELECT output.
 

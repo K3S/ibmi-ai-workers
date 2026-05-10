@@ -7,7 +7,7 @@ has_children: false
 # Operating in production
 {: .no_toc }
 
-**Status:** Draft V1 — speculative
+**Status:** Draft V2 V2 — speculative
 
 Most "AI worker" tutorials stop before this chapter. That's also where most production failures live. Observability, monitoring, restart behavior, capacity planning, debugging — the boring infrastructure that determines whether the system survives contact with reality.
 
@@ -58,7 +58,7 @@ CRTUSRPRF USRPRF(K3SAIWRK)                                    +
 
 The profile needs the following authority:
 
-- `*USE` on `/www/k3s-ai-worker/` (read code from IFS)
+- `*USE` on `/opt/k3s/ai-worker/` (read code from IFS)
 - `*USE` on `K3SAI` library (read profile/key tables)
 - `*CHANGE` on `K3SAI/USAGE_LOG` (write usage rows)
 - `*USE` on `K3SAI/AIOUTQ` (consume AI requests)
@@ -69,7 +69,7 @@ It deliberately does **not** have authority on customer operational tables. The 
 ### The IFS directory
 
 ```
-/www/k3s-ai-worker/
+/opt/k3s/ai-worker/
 ├── bin/
 │   └── worker.php
 ├── src/
@@ -113,7 +113,7 @@ ADDENVVAR ENVVAR(K3SAI_TIMEOUT_MS)    VALUE('60000')   REPLACE(*YES)
 ADDENVVAR ENVVAR(K3SAI_MAX_RETRIES)   VALUE('5')       REPLACE(*YES)
 
 /* Run PHP via QSH */
-QSH CMD('/QOpenSys/pkgs/bin/php /www/k3s-ai-worker/bin/worker.php')
+QSH CMD('/QOpenSys/pkgs/bin/php /opt/k3s/ai-worker/bin/worker.php')
 
 /* Reached only when PHP exits */
 SNDPGMMSG MSG('K3S AI Worker exited; subsystem will restart.')
@@ -205,7 +205,7 @@ After the next IPL — or after running it manually once — workers run continu
 
 ### Sizing the worker count
 
-V1 starting point: **4 workers.** Each holds up to 30 in-flight AI calls via Guzzle's connection pool, so 120 concurrent calls total. At ~1 second average AI latency, that's roughly 120 calls/second steady-state — enough for early scale.
+V1 starting point: **4 workers.** Each holds up to 30 in-flight AI calls via Guzzle's connection pool, so 120 concurrent calls total. At ~1 second average AI latency, that's roughly 120 calls/second steady-state — enough for early platform scale.
 
 The constraints on worker count, in order of how often they bind:
 
@@ -251,7 +251,7 @@ Workers killed mid-request. In-flight AI calls become orphaned (they may complet
 
 The deploy procedure:
 
-1. Push new code to `/www/k3s-ai-worker/`.
+1. Push new code to `/opt/k3s/ai-worker/`.
 2. `composer install --no-dev` if dependencies changed.
 3. Verify with `php -l bin/worker.php` (lint check) and a quick smoke test in QSH.
 4. `ENDSBS SBS(AIWRK) OPTION(*CNTRLD) DELAY(60)` — workers drain.
@@ -575,7 +575,7 @@ What needs to be backed up:
 - **`K3SAI.KEY_VAULT`** — encrypted keys. Useless without the KEK, but back up both together (they're useless separately).
 - **`K3SAI.USAGE_LOG`** — billing source of truth. Critical to retain.
 - **The KEK file** at `/QIBM/UserData/K3SAI/kek/`. Back up to secure offline storage.
-- **The PHP code** at `/www/k3s-ai-worker/`. Source-controlled, but a snapshot of the running version is useful.
+- **The PHP code** at `/opt/k3s/ai-worker/`. Source-controlled, but a snapshot of the running version is useful.
 
 What doesn't need to be backed up:
 

@@ -7,7 +7,7 @@ has_children: false
 # Quickstart 1 — One worker, one round trip (RPG only)
 {: .no_toc }
 
-**Status:** Draft V1 — code untested on Calvin yet
+**Status:** Draft V2
 
 This chapter walks you through the smallest end-to-end version of the architecture, with one important constraint: **everything is RPG.** No PHP. No second toolchain. Your IBM i talks directly to the AI provider over HTTPS using built-in SQL services.
 
@@ -42,8 +42,8 @@ You should be able to answer "yes" to all the items in the [Foundations ready ch
 - IBM i system you can deploy to, with authority to create libraries, tables, and compile programs.
 - Outbound HTTPS to `api.anthropic.com` works from your IBM i.
 - An Anthropic API key.
-- YAJL installed for RPG JSON parsing (`DATA-INTO`/`DATA-GEN` parsers). Most modern IBM i shops have it; if not, it's a free download from Scott Klement.
-- IBM i 7.4 or newer for `QSYS2.HTTP_POST_VERBOSE` and other HTTP SQL services. Older versions can use `SYSTOOLS.HTTPPOSTCLOB` with adjustments noted in the troubleshooting section.
+- YAJL installed for RPG JSON parsing (`DATA-INTO`/`DATA-GEN` parsers).
+- IBM i 7.4 or newer for `QSYS2.HTTP_POST` and other HTTP SQL services. Older versions can use `SYSTOOLS.HTTPPOSTCLOB` with adjustments.
 
 The demo creates one library (`DEMOLIB`) and one table (`DEMOLIB/DEMO_INPUT`). Cleanup at the end of the chapter removes the library entirely.
 
@@ -116,8 +116,6 @@ VALUES
     (5, 100, 200, 300, 'Y');
 ```
 
-Three correct claims, two wrong. The AI should agree with the correct ones and disagree with the wrong ones.
-
 ### Step 4: Set up an environment variable for the API key
 
 The worker needs to read the Anthropic API key at runtime. The cleanest way to do this in RPG without baking the key into source code is to store it in a data area. Create one:
@@ -152,7 +150,7 @@ Four programs. Compile each into `DEMOLIB`.
 
 ### `AIPRE` — pre-AI logic
 
-Reads a row from `DEMO_INPUT` and builds the prompt string. In production this is where significant business logic lives (vendor lookups, demand history, policy text). For the demo it formats three numbers into a sentence.
+Reads a row from `DEMO_INPUT` and builds the prompt string.
 
 ```rpg
 **FREE
@@ -201,12 +199,11 @@ dcl-proc AICALL export;
     inPrompt varchar(2000) const;
   end-pi;
 
-  dcl-s requestJson varchar(4000);
-  dcl-s responseJson varchar(8000);
+  dcl-s requestJson varchar(4000) ccsid(*utf8);
+  dcl-s responseJson varchar(8000) ccsid(*utf8);
   dcl-s apiKey varchar(200);
   dcl-s headers varchar(1000);
 
-  // Request structure for DATA-GEN
   dcl-ds request qualified;
     model varchar(50);
     max_tokens int(10);
@@ -217,30 +214,25 @@ dcl-proc AICALL export;
     end-ds;
   end-ds;
 
-  // Get API key from data area
   in apiKey datarea('AIKEY');
   apiKey = %trimr(apiKey);
 
-  // Build request structure
   request.model = 'claude-sonnet-4-5';
   request.max_tokens = 50;
   request.temperature = 0;
   request.messages(1).role = 'user';
   request.messages(1).content = inPrompt;
 
-  // Generate request JSON
   data-gen request 
            %data(requestJson : 'noprefix=request_') 
            %gen('YAJL/YAJLDTAGEN');
 
-  // Build headers
   headers = '<httpHeader>' +
             '<header name="x-api-key" value="' + %trim(apiKey) + '"/>' +
             '<header name="anthropic-version" value="2023-06-01"/>' +
             '<header name="content-type" value="application/json"/>' +
             '</httpHeader>';
 
-  // Make the HTTPS POST call
   exec sql 
     set :responseJson = 
       QSYS2.HTTP_POST(
@@ -255,13 +247,13 @@ end-proc;
 
 A few notes:
 
-The `QSYS2.HTTP_POST` SQL service does the HTTPS call. It's part of IBM i 7.4 and later. Returns the response body as a CLOB.
+The `QSYS2.HTTP_POST` SQL service does the HTTPS call. Returns the response body as a CLOB.
 
-The headers are passed as XML, which is the format `QSYS2.HTTP_POST` expects. Older versions of IBM i may use `SYSTOOLS.HTTPPOSTCLOB` with slightly different syntax.
+The headers are passed as XML — that's the format `QSYS2.HTTP_POST` expects.
 
-The request JSON is built with `DATA-GEN` and YAJL — same pattern as the RPG+PHP version. The request structure includes the full Anthropic Messages API shape.
+The request and response variables are declared `ccsid(*utf8)` so RPG handles UTF-8 correctly when sending to and receiving from Anthropic.
 
-The API key is read from the data area at the top of the procedure. For production, this would be more sophisticated — per-customer key resolution, decryption, audit logging. For the demo, one shared key works.
+The API key is read from the data area. For production, this would be more sophisticated.
 
 **TLS handshake overhead.** Each call to `AICALL` opens a fresh TLS connection to Anthropic. That's roughly 100-300ms of overhead per call, on top of the AI's response time. For a five-row demo this is invisible. For 10,000-row batches it matters — and it's the main reason [the PHP transport layer]({% link why-php/index.md %}) exists.
 
@@ -279,7 +271,6 @@ dcl-proc AIPOST export;
     inResponseRaw  varchar(8000)  const;
   end-pi;
 
-  // Anthropic API response structure
   dcl-ds anthropicResp qualified;
     dcl-ds content dim(10);
       type varchar(20);
@@ -292,7 +283,6 @@ dcl-proc AIPOST export;
     stop_reason varchar(50);
   end-ds;
 
-  // The AI's inner JSON response
   dcl-ds aiResult qualified;
     correct    ind;
     actual_sum int(10);
@@ -302,7 +292,6 @@ dcl-proc AIPOST export;
   dcl-s verdict     char(1);
   dcl-s rawResponse varchar(2000);
 
-  // Parse Anthropic's response envelope
   monitor;
     data-into anthropicResp 
               %data(inResponseRaw) 
@@ -317,7 +306,6 @@ dcl-proc AIPOST export;
     return;
   endmon;
 
-  // Extract the AI's text from the first content block
   if %elem(anthropicResp.content) >= 1 and 
      anthropicResp.content(1).type = 'text';
     aiText = anthropicResp.content(1).text;
@@ -331,7 +319,6 @@ dcl-proc AIPOST export;
     return;
   endif;
 
-  // Parse the AI's structured response
   monitor;
     data-into aiResult 
               %data(aiText) 
@@ -346,7 +333,6 @@ dcl-proc AIPOST export;
     return;
   endmon;
 
-  // Happy path
   if aiResult.correct;
     verdict = 'Y';
   else;
@@ -367,7 +353,7 @@ end-proc;
 
 This program is meaningfully more complex than its RPG+PHP counterpart. The reason: in the RPG+PHP version, PHP normalized the response shape before sending it back. Here, RPG receives Anthropic's raw response and has to navigate it directly: first the API envelope (`content[0].text`), then the AI's inner JSON.
 
-That's the cost of pure RPG — every program that calls AI has to handle provider-specific response shapes itself, or you build a `AICALL` wrapper that normalizes them. We're doing the simpler thing for the demo.
+That's the cost of pure RPG — every program that calls AI has to handle provider-specific response shapes itself, or you build a `AICALL` wrapper that normalizes them.
 
 ### `DEMOWRK` — the worker
 
@@ -378,7 +364,6 @@ Loops over unprocessed rows. For each: calls `AIPRE`, calls `AICALL`, calls `AIP
 ctl-opt dftactgrp(*no) actgrp('DEMOWRK')
         option(*srcstmt: *nodebugio: *nounref);
 
-// External procedure prototypes
 dcl-pr AIPRE varchar(2000) extproc('AIPRE');
   rowId int(10) const;
 end-pr;
@@ -392,13 +377,11 @@ dcl-pr AIPOST extproc('AIPOST');
   responseRaw varchar(8000)  const;
 end-pr;
 
-// Variables
 dcl-s rowId       int(10);
 dcl-s prompt      varchar(2000);
 dcl-s responseRaw varchar(8000);
 dcl-s eof         ind inz(*off);
 
-// === Main loop ===
 exec sql declare workCursor cursor for
   select ROW_ID 
     from DEMOLIB/DEMO_INPUT
@@ -443,8 +426,6 @@ SNDPGMMSG MSG('Demo worker submitted as DEMOWRK1.')
 
 ENDPGM
 ```
-
-Same as the RPG+PHP version. The CL doesn't change — only what `DEMOWRK` does internally.
 
 ### Compile
 
@@ -502,8 +483,6 @@ Or by checking active jobs:
 WRKACTJOB SBS(QBATCH)
 ```
 
-You should see `DEMOWRK1` running for a few seconds, then complete.
-
 ---
 
 ## Verifying results
@@ -516,32 +495,13 @@ SELECT ROW_ID, NUM_A, NUM_B, CLAIMED_SUM,
   ORDER BY ROW_ID;
 ```
 
-You should see all five rows filled in:
-
-```
-ROW_ID NUM_A NUM_B CLAIMED EXPECTED AI_VERDICT AI_ACTUAL PROCESSED_AT
-   1     1     1      2      Y         Y          2     2026-05-07-...
-   2     3     4      8      N         N          7     2026-05-07-...
-   3    10    15     25      Y         Y         25     2026-05-07-...
-   4     7     7     13      N         N         14     2026-05-07-...
-   5   100   200    300      Y         Y        300     2026-05-07-...
-```
+You should see all five rows filled in.
 
 What you're looking for:
 
-- **All five rows have `PROCESSED_AT` filled in.** If not, the worker errored. Check the joblog of `DEMOWRK1` — likely an HTTP failure or a parse error.
-- **`AI_VERDICT` matches `EXPECTED_CORRECT` for all five.** If the AI got addition wrong, that's a model issue, not a demo bug.
+- **All five rows have `PROCESSED_AT` filled in.** If not, the worker errored. Check the joblog of `DEMOWRK1`.
+- **`AI_VERDICT` matches `EXPECTED_CORRECT` for all five.**
 - **`AI_ACTUAL_SUM` is the correct math.** Should be 2, 7, 25, 14, 300.
-
-If you want to see the AI's raw responses:
-
-```sql
-SELECT ROW_ID, AI_RESPONSE_RAW 
-  FROM DEMOLIB/DEMO_INPUT 
-  ORDER BY ROW_ID;
-```
-
-You should see clean JSON like `{"correct": true, "actual_sum": 2}` for each row.
 
 ---
 
@@ -567,7 +527,7 @@ Then `CALL DEMOLIB/DEMOSTART` again.
 DLTLIB LIB(DEMOLIB)
 ```
 
-This removes the table, the data area (and the API key with it), the programs, and the source. Nothing else lingers on the system.
+This removes the table, the data area (and the API key with it), the programs, and the source.
 
 ---
 
@@ -581,27 +541,14 @@ This is enough for many production use cases. If your AI workload is modest — 
 
 ## What's deliberately not in this demo
 
-- **Parallelism.** One row at a time. Five rows takes 5x the per-call latency. We add parallelism in [Quickstart 2 (RPG only)]({% link quickstart-2-rpg/index.md %}).
-- **Connection reuse.** Each `AICALL` opens a fresh TLS connection to Anthropic. ~200ms of handshake overhead per call. Real but acceptable for this scale.
-- **Retry logic.** A 429 from Anthropic fails the call. Production would back off and retry.
-- **Per-customer profiles.** Hardcoded model and key in `AICALL`. Production resolves these per-customer.
+- **Parallelism.** We add it in [Quickstart 2 (RPG only)]({% link quickstart-2-rpg/index.md %}).
+- **Connection reuse.** Each `AICALL` opens a fresh TLS connection. ~200ms of handshake overhead per call.
+- **Retry logic.** A 429 from Anthropic fails the call.
+- **Per-customer profiles.** Hardcoded model and key in `AICALL`.
 - **Rate limit handling.** No throttling.
-- **Provider abstraction.** The code is hardcoded for Anthropic's API shape. Switching to OpenAI means rewriting `AICALL` and `AIPOST`.
-- **Streaming responses.** The whole response is collected before parsing.
+- **Provider abstraction.** The code is hardcoded for Anthropic's API shape.
 
 These limitations accumulate. By the time you need all of them, you're considering whether to build them in RPG or to introduce PHP as the transport layer. That's the conversation in [Why PHP for the delivery layer]({% link why-php/index.md %}).
-
----
-
-## Switching to a different provider
-
-If you'd rather use OpenAI or another provider, three things change:
-
-- The endpoint URL in `AICALL` (e.g., `https://api.openai.com/v1/chat/completions`).
-- The auth header format (`Authorization: Bearer ...` instead of `x-api-key`).
-- The response parsing in `AIPOST` (OpenAI's response shape is different from Anthropic's).
-
-The structural work is the same in any provider. Each just has its own protocol weirdness.
 
 ---
 

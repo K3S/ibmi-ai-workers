@@ -7,7 +7,7 @@ has_children: false
 # The RPG worker pool
 {: .no_toc }
 
-**Status:** Draft V2 V2
+**Status:** Draft V3 V2
 
 The RPG worker pool is where K3S's domain logic lives. It's also where most of the production lines of code in this architecture end up — the PHP worker is small by design, but the RPG side has all the business rules, all the DB2 access, and all the orchestration. This chapter covers the production-shape patterns: how the batch initiator works, how worker jobs are sized and submitted, how they coordinate, how they fail, and how they recover.
 
@@ -334,6 +334,42 @@ A note on tuning: don't measure with a 5-row batch. Measure with a 1,000-row bat
 The pattern naturally supports multiple concurrent batches, both within a customer and across customers.
 
 **Within a customer**: each batch has its own `batch_id`, its own work units in `WORK_QUEUE`, and its own set of workers. Multiple batches running concurrently means more workers running concurrently and `WORK_QUEUE` contains units from multiple batches mixed FIFO.
+
+This creates a real concern: **a worker submitted for batch A might pull a work unit that belongs to batch B.** FIFO ordering on the shared queue doesn't respect batch boundaries. If batches A and B are running simultaneously, every worker is eligible to pull any work unit from the queue.
+
+For most use cases this is fine — the work itself is the same, and the row gets processed correctly regardless of which worker picks it up. But the *batch metadata* gets confused: batch A's `PROCESSED_UNITS` doesn't increment when a worker (which thinks it's working for A) processes a row from B. Batch A may never reach "complete" because some of its rows got eaten by other workers.
+
+Three production-shape fixes, in order of complexity:
+
+1. **Validate `batch_id` per work unit.** Each worker reads the batch_id from the message, checks against its own assigned batch_id, and re-queues the message if it doesn't match. Loses a tiny bit of efficiency (the worker already RCVDTAQ'd the message) but recovers correctness.
+
+2. **One queue per batch.** Each batch creates `WORK_QUEUE_<batch_id>` at startup, deletes it at completion. Stronger isolation; adds queue lifecycle overhead and orphan-cleanup concerns.
+
+3. **Workers don't bind to a specific batch.** Workers consume whatever they get, and update whatever batch's metadata the row belongs to (looking up batch_id from the row, or from the work message). Most flexible, but breaks the "this batch knows when it's done" mental model.
+
+Pattern 1 is usually the right choice — minimal code change, preserves the simple architecture, just adds a check. Pseudocode for the worker:
+
+```rpg
+// After receiving from WORK_QUEUE
+data-into workUnit %data(workMessage) %parser('YAJL/YAJLINTO');
+
+if workUnit.batch_id <> myBatchId;
+  // Not my batch — put it back and try again
+  exec sql call qsys2.send_data_queue_utf8(
+    MESSAGE_DATA       => :workMessage,
+    DATA_QUEUE         => 'WORK_QUEUE',
+    DATA_QUEUE_LIBRARY => :customerLib
+  );
+  iter;  // try the next message
+endif;
+
+// Process normally
+processRow(workUnit.row_id);
+```
+
+The re-queue puts it at the back of the FIFO, where another worker (presumably belonging to that batch) will eventually pick it up. Risk: if no worker is running for that batch_id, the message lives in the queue forever. Mitigate with: a periodic cleanup job that removes work units whose batch_id corresponds to a `STATUS = 'failed'` or no-longer-existing batch.
+
+For V1, with only one batch per customer running at a time, this concern doesn't apply. Single-tenant, single-batch demos work fine without the validation. Production can't make that assumption.
 
 **Across customers**: each customer has its own `WORK_QUEUE` in their own library. Workers in customer A pull from `ACME_5DTA/WORK_QUEUE`; workers in customer B pull from `BARCO_5DTA/WORK_QUEUE`. They never share work queues. They *do* share `AI_OUT_QUEUE` in the K3S admin library — the PHP worker doesn't care which customer a request came from, it just serves it.
 

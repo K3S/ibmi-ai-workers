@@ -39,13 +39,19 @@ nav_external_links:
     url: https://k3s.com
     hide_icon: false
   - title: RPG Tutorial
-    url: https://rpgtutorial.k3s.com
+    url: https://rpgtutorial.k3s.com/
+    hide_icon: false
+  - title: IBM i Open Source Setup
+    url: https://ospm.k3s.com/
     hide_icon: false
   - title: PHP, PDO & ODBC on IBM i
     url: https://odbcphp.k3s.com/
     hide_icon: false
   - title: Action API Pattern
     url: https://action-api-pattern.k3s.com/
+    hide_icon: false
+  - title: AI Patterns For Business Systems
+    url: https://aipatterns.k3s.com
     hide_icon: false
     
 # Code copy button

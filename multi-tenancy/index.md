@@ -1,13 +1,13 @@
 ---
 title: Multi-tenancy
-nav_order: 12
+nav_order: 9
 has_children: false
 ---
 
 # Multi-tenancy
 {: .no_toc }
 
-**Status:** Draft V1
+**Status:** Draft V2 V2
 
 This chapter is about how one shared PHP worker serves dozens of customers without knowing which one is which, and how each customer's choice of AI provider, model, and key gets resolved at runtime without polluting the worker code with customer-specific branches. The IBM i platform makes this easier than it would be on most stacks — library lists do most of the work — but there are real decisions to make about where shared admin data lives and how customer profiles are looked up.
 
@@ -23,7 +23,7 @@ If you've read [The PHP worker]({% link php-worker/index.md %}) and [The RPG wor
 
 ## The shape
 
-Two libraries per customer (the standard K3S split: `<CODE>_5DTA` for data, `<CODE>_5OBJ` for objects). One shared admin library for K3S itself: `K3SAI`. The PHP worker lives in IFS at `/www/k3s-ai-worker/`, one installation, shared.
+Two libraries per customer (the standard K3S split: `<CODE>_5DTA` for data, `<CODE>_5OBJ` for objects). One shared admin library for K3S itself: `K3SAI`. The PHP worker lives in IFS at `/opt/k3s/ai-worker/`, one installation, shared.
 
 ```
                   ┌──────────────────────┐

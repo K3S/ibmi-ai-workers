@@ -7,11 +7,11 @@ has_children: false
 # The data queue contract
 {: .no_toc }
 
-**Status:** Draft V1 — under review
+**Status:** Draft V2
 
-This chapter specifies the API between RPG and PHP. Every other chapter assumes the contract defined here. If you only read three chapters, this is the third.
+The architecture chapter described two halves of a system separated by a queue. This chapter pins down the exact shape of every message that crosses the boundary. Once it's settled, both sides can be built independently — the RPG side is written to produce and consume the formats specified here; the PHP worker is written against the same specification; neither side needs to read the other's code to get integration right.
 
-This is the most important chapter to get right. A wrong decision here propagates into both halves of the system and is painful to walk back. We've tried to be specific about what's settled and what's still open. Sections marked **Open for discussion** are the places we expect feedback, especially from RPG developers reading this.
+The contract isn't fancy. It's just JSON, sent over IBM i data queues, with carefully chosen fields. But it's the most important chapter in this guide to get right, because changes to it later are expensive.
 
 ## Table of contents
 {: .no_toc .text-delta }
@@ -21,170 +21,122 @@ This is the most important chapter to get right. A wrong decision here propagate
 
 ---
 
-## Why this chapter matters
+## Why a contract
 
-The architecture chapter described two halves of a system separated by a queue. This chapter pins down the exact shape of every message that crosses the boundary. Once it's settled, both sides can be built independently — the RPG side is written to produce and consume the formats specified here; the PHP worker is written against the same specification; neither side needs to read the other's code to get integration right.
+Without a contract, RPG and PHP each end up encoding assumptions about each other in their code. The PHP worker assumes "RPG sends a JSON blob with a `prompt` field." RPG assumes "PHP sends back a JSON blob with `status` and `response` fields." When those assumptions diverge — and they will — debugging becomes archaeology.
 
-The cost of getting it wrong is paid every time the contract is revised. Every change has to ship to both sides, in compatible order, without breaking in-flight messages. Get the first version right and most contract changes are additive. Get the first version wrong and you'll spend a year managing migrations.
+A contract pulls all of those assumptions out into one place. Both sides reference it. Changes are deliberate, versioned, communicated. The contract is the API; everything else is implementation.
 
----
+The contract's job is to:
 
-## The shape of the conversation
+- Specify the structure of every message
+- Specify required vs optional fields
+- Specify how errors are communicated
+- Specify how the contract itself can evolve over time
 
-The boundary uses a request/reply pattern over data queues:
-
-1. RPG worker assembles a prompt and writes a request message to **AI_OUT_QUEUE**, including the name of its private reply queue.
-2. A PHP worker pulls the request off AI_OUT_QUEUE, calls the AI provider, and writes a response message to the reply queue named in the request.
-3. The originating RPG worker reads from its reply queue and processes the response.
-
-Three things are worth noting up front:
-
-- **Request and reply are different message formats.** They share a request_id for correlation but otherwise have different fields.
-- **Reply queues are per-RPG-worker, not per-batch and not per-customer.** Each long-lived RPG worker creates its own reply queue at startup and tears it down at shutdown. This avoids contention and gives natural isolation.
-- **AI_OUT_QUEUE is shared across all customers.** PHP workers don't filter by customer — they take the next request and serve it. The customer context travels in the message itself.
+This chapter does all four.
 
 ---
 
-## Queue inventory
+## The transport: data queues, UTF-8
 
-Three queues exist in the contract. They have different lifetimes, different scopes, and different creation parameters.
+The contract uses two IBM i data queues per round trip:
 
-### AI_OUT_QUEUE
+- `K3SAI/AIOUTQ` — the shared inbound queue. RPG writes requests; PHP reads them. One queue, all customers, FIFO.
+- A per-worker reply queue named in each request. PHP writes replies to the queue address the request specified.
 
-- **Scope:** Shared across all customers.
-- **Library:** Lives in a K3S admin library. Working name: `K3SAI` (open for discussion).
-- **Lifetime:** Permanent. Created once at install time, exists for the life of the system.
-- **Direction:** RPG worker → PHP worker.
-- **Type:** Sequential (FIFO). Not keyed.
-- **Producer:** Any RPG worker, in any customer's batch.
-- **Consumer:** Any PHP worker.
+Both directions use **UTF-8**. This is a hard requirement, not a suggestion.
 
-### Reply queues
+### Why UTF-8 is non-negotiable
 
-- **Scope:** Per RPG worker.
-- **Library:** Lives in the customer's library.
-- **Lifetime:** Created when an RPG worker starts; deleted when it exits.
-- **Naming convention (V1 proposal):** `RPLY_{worker_id}` where `worker_id` is a 6-digit zero-padded number assigned by the batch initiator. So a worker assigned ID 7 in customer ACME has reply queue `ACME_5DTA/RPLY_000007`.
-- **Direction:** PHP worker → RPG worker.
-- **Type:** Sequential (FIFO).
-- **Producer:** PHP worker (whichever one served the request).
-- **Consumer:** Exactly one RPG worker — the one that owns the queue.
+JSON requires a Unicode encoding. The standard JSON spec assumes UTF-8. PHP strings are bytes; when PHP runs `json_encode()`, the output is UTF-8 bytes. Every AI provider's API expects UTF-8 in its request body. Every modern HTTP API operates in UTF-8.
 
-### WORK_QUEUE
+But IBM i jobs typically run in CCSID 37 (EBCDIC). If you put text on a data queue from an EBCDIC job and read it from a UTF-8 process, the bytes get mangled in conversion. Garbage characters. JSON parsing fails on any non-ASCII content.
 
-WORK_QUEUE is mentioned in the architecture chapter but is **not part of the RPG/PHP contract.** It's an internal RPG-to-RPG queue used by the batch initiator to feed work to RPG workers. PHP never reads from it. Its format is up to your RPG team and is covered in [The RPG worker pool]({% link rpg-pool/index.md %}).
+The fix is to use the **UTF-8-specific variants** of the SQL data queue procedures:
+
+- **Sending:** `QSYS2.SEND_DATA_QUEUE_UTF8` (not `SEND_DATA_QUEUE`)
+- **Receiving:** select `MESSAGE_DATA_UTF8` column from `QSYS2.RECEIVE_DATA_QUEUE` (not `MESSAGE_DATA`)
+
+These variants tell IBM i: "the bytes I'm giving you are UTF-8, store them as such" and "give me back UTF-8 bytes regardless of my job's CCSID." Combined, they make the whole round trip CCSID-agnostic.
+
+In RPG, declare any variable that holds queue payload data with `ccsid(*utf8)`:
+
+```rpg
+dcl-s requestJson varchar(4000) ccsid(*utf8);
+dcl-s responseJson varchar(4000) ccsid(*utf8);
+```
+
+This makes RPG handle the encoding conversion when binding to SQL.
+
+In PHP, no special handling is needed — PHP strings are already UTF-8 bytes by convention.
+
+### The rule
+
+**Whenever data crosses the RPG↔PHP boundary via a queue, use the UTF-8 variants. No exceptions.**
+
+Every code sample in this chapter and every quickstart follows this rule.
 
 ---
 
-## Queue creation parameters
+## Creating a data queue
 
-These are the recommended `CRTDTAQ` parameters for V1. Open for review by your IBM i team.
-
-### AI_OUT_QUEUE
+A data queue is created with `CRTDTAQ`. The relevant parameters for our contract:
 
 ```
-CRTDTAQ DTAQ(K3SAI/AIOUTQ)
-        TYPE(*STD)
-        MAXLEN(2000000)
-        SEQ(*FIFO)
-        FORCE(*NO)
-        AUT(*USE)
+CRTDTAQ DTAQ(K3SAI/AIOUTQ) +
+        TYPE(*STD) +
+        MAXLEN(64512) +
+        SEQ(*FIFO) +
+        FORCE(*NO) +
+        AUT(*USE) +
         TEXT('K3S AI Worker - inbound request queue')
-        CCSID(1208)
 ```
 
-**Notes:**
+Notes:
 
-- **MAXLEN(2000000)** — 2 MB. Prompts with embedded product context, vendor history, and policy text can get large. 2 MB gives margin without being absurd. If you find yourself needing more, consider the "prompt-by-reference" pattern below.
-- **SEQ(*FIFO)** — Strict first-in-first-out. We're not using priority queuing in V1. If you add it later, the field is in the message format already.
-- **CCSID(1208)** — UTF-8. JSON is UTF-8 by convention, and AI provider APIs expect UTF-8. RPG jobs running in EBCDIC will need to convert on the way in.
-- **FORCE(*NO)** — Don't force writes to disk synchronously. Faster, and we don't need durability guarantees stronger than "queue survives normal operation."
+**`MAXLEN(64512)` is the maximum allowed for a standard data queue.** Plenty for V1 contract messages (typically 500-1500 bytes for a demo, 5-30 KB for production purchasing prompts). If your real prompts ever approach this limit, switch to a "prompt-by-reference" pattern (described below) rather than expanding to a different queue type.
 
-### Reply queues
+**No `CCSID` parameter on `CRTDTAQ`.** The queue itself doesn't have a CCSID — it stores raw bytes. CCSID handling happens at the send/receive boundary via the `_UTF8` procedure variants.
 
-```
-CRTDTAQ DTAQ({customer_lib}/RPLY_{worker_id})
-        TYPE(*STD)
-        MAXLEN(2000000)
-        SEQ(*FIFO)
-        FORCE(*NO)
-        AUT(*EXCLUDE)
-        TEXT('K3S AI Worker - reply queue for worker {worker_id}')
-        CCSID(1208)
-```
+**`TYPE(*STD)`.** Standard data queue. Other types (keyed, distributed) are interesting in advanced architectures but not in V1.
 
-**Notes:**
+**`SEQ(*FIFO)`.** First in, first out. Important for fair ordering across customers.
 
-- **AUT(*EXCLUDE)** with explicit grants to the worker's user profile and the PHP worker's user profile. Reply queues should not be readable by anyone else.
-- Reply queues should be **deleted on worker shutdown.** The RPG worker's exit routine should `DLTDTAQ` its own queue. Stale reply queues from crashed workers are cleaned up by a daily job (covered in operations).
+**`AUT(*USE)`.** Default authority is "use" (read and write). Production may want tighter, with explicit authority grants per user profile.
+
+The same parameters apply to per-worker reply queues. They get created and destroyed dynamically by RPG workers as they start and stop.
 
 ---
 
-## Message format philosophy
+## Verifying the SQL services exist
 
-V1 uses **JSON over UTF-8 data queue messages.** Here's why, and what we considered.
+Before going further, confirm your IBM i has the SQL data queue services. From any SQL session:
 
-### Why JSON
+```sql
+SELECT ROUTINE_NAME 
+  FROM QSYS2.SYSROUTINES
+ WHERE ROUTINE_SCHEMA = 'QSYS2'
+   AND ROUTINE_NAME LIKE '%DATA_QUEUE%'
+ ORDER BY ROUTINE_NAME;
+```
 
-Three reasons:
+You should see at least:
 
-1. **Self-describing.** Adding a new field doesn't require recompiling either side. Old consumers ignore unknown fields; new consumers default the missing ones. This is the property that makes contract evolution survivable.
-2. **Native to PHP.** Zero friction.
-3. **Workable in modern RPG.** YAJL, the SQL-based `JSON_OBJECT`/`JSON_VALUE` functions, and the `DATA-INTO`/`DATA-GEN` built-ins all handle JSON well. Not as cheap as fixed-format binary, but cheap enough.
+- `RECEIVE_DATA_QUEUE`
+- `SEND_DATA_QUEUE`
+- `SEND_DATA_QUEUE_UTF8`
+- `SEND_DATA_QUEUE_BINARY`
+- `CLEAR_DATA_QUEUE`
+- `DATA_QUEUE_INFO`
 
-### What we considered and rejected
-
-- **Fixed-format binary structures (RPG-style data structures laid out in memory).** Faster on the RPG side, but every change is a recompile on both sides, and PHP would need to mirror the RPG layout. The coupling is too tight for a contract that will evolve.
-- **XML.** Verbose, slow to parse on both sides, and nobody reaches for it in 2026 unless they're talking to a SOAP service.
-- **Protocol Buffers.** Tempting for performance, but adds a code-generation step on both sides and isn't idiomatic on IBM i. Maybe in V3 if we have throughput problems we don't have today.
-
-### CCSID handling
-
-Data queues store bytes. JSON is UTF-8. RPG jobs typically run in EBCDIC (CCSID 37 or similar). Two implications:
-
-- **RPG must convert outgoing strings to UTF-8 before SNDDTAQ.** YAJL's encoder handles this when configured for CCSID 1208 output. The SQL `JSON_OBJECT` function with `RETURNING CLOB CCSID 1208` also works.
-- **RPG must convert incoming UTF-8 to job CCSID after RCVDTAQ.** Same tools in reverse.
-- **PHP side is UTF-8 native** in PASE. No conversion needed there.
-
-If you're new to CCSID conversion in RPG, this is the most likely place to lose a day. Test with a non-ASCII character (an em-dash, a fancy quote, a vendor name with a Spanish ñ) early. It will reveal CCSID mistakes that ASCII-only tests miss.
+If `SEND_DATA_QUEUE_UTF8` is missing, your DB2 PTF Group is too old for the contract as written. You'll need to either upgrade DB2 services, or use a different approach (calling the data queue APIs directly via SRVPGM rather than SQL services).
 
 ---
 
-## AI_OUT_QUEUE message format (RPG → PHP)
+## The request format
 
-Every message on AI_OUT_QUEUE is a single JSON object. The fields are:
-
-### Required fields
-
-| Field | Type | Description |
-|:---|:---|:---|
-| `version` | string | Contract version. V1 is `"1.0"`. PHP rejects unknown major versions. |
-| `request_id` | string (UUID) | Generated by RPG. Used for correlation and logging. Must be unique. |
-| `customer` | string (3-10 chars) | K3S customer code (e.g., `"ACME"`, `"DMO"`). |
-| `profile_ref` | string | Lookup key into the AI profile table. Determines provider, model, key. |
-| `reply_queue` | object | The queue PHP should send the response to. See below. |
-| `prompt` | string | The full text to send to the AI. UTF-8. |
-
-### `reply_queue` sub-object
-
-| Field | Type | Description |
-|:---|:---|:---|
-| `library` | string | Library name. Normally the customer library. |
-| `name` | string | Queue name. E.g., `"RPLY_000007"`. |
-
-### Optional fields
-
-| Field | Type | Default | Description |
-|:---|:---|:---|:---|
-| `model_override` | string | (profile default) | Override the profile's default model for this request. |
-| `temperature` | number | (profile default) | LLM sampling temperature, 0.0 to 2.0. |
-| `max_tokens` | integer | (profile default) | Maximum response tokens. |
-| `system_prompt` | string | (profile default or none) | System prompt. Many providers use this; some don't. |
-| `timeout_ms` | integer | 60000 | How long PHP waits for the AI before returning a timeout error. |
-| `priority` | integer | 5 | 1 (highest) to 9 (lowest). Reserved for future use; PHP ignores in V1. |
-| `metadata` | object | `{}` | Opaque to PHP. Echoed back unchanged in the response. Use this for `batch_id`, `line_id`, anything you need on the way back. |
-
-### Example
+JSON sent from RPG to PHP via `K3SAI/AIOUTQ`. UTF-8 (CCSID 1208).
 
 ```json
 {
@@ -194,99 +146,100 @@ Every message on AI_OUT_QUEUE is a single JSON object. The fields are:
   "profile_ref": "ACME_DEFAULT",
   "reply_queue": {
     "library": "ACME_5DTA",
-    "name": "RPLY_000007"
+    "name": "RPLY_000001"
   },
-  "prompt": "You are a purchasing analyst. Review the following PO line...\n\nItem: 12oz canned soup\nVendor minimum: 24\nOn hand: 8\nDemand last 30 days: 50\n\nRespond with one word: OK or FLAG.",
-  "max_tokens": 50,
-  "timeout_ms": 30000,
+  "prompt": "...",
+  "system_prompt": "(optional)",
+  "max_tokens": 1024,
+  "temperature": 0.0,
+  "model_override": "(optional, overrides profile)",
+  "timeout_ms": 60000,
   "metadata": {
-    "batch_id": "BATCH_20260507_0001",
-    "line_id": 4271,
-    "po_number": "PO123456"
+    "row_id": 12345,
+    "batch_id": "BATCH_2026_05_07_001"
   }
 }
 ```
 
-### Notes on field choices
+| Field | Type | Required | Notes |
+|:---|:---|:---|:---|
+| `version` | string | yes | Currently `"1.0"` |
+| `request_id` | string | yes | UUID, unique per request. Used for log correlation |
+| `customer` | string | yes | Customer code, e.g. `"ACME"` |
+| `profile_ref` | string | yes | Profile name from `K3SAI.AI_PROFILE` |
+| `reply_queue.library` | string | yes | Where to send reply |
+| `reply_queue.name` | string | yes | Reply queue name |
+| `prompt` | string | yes | The actual user prompt |
+| `system_prompt` | string | no | Provider-specific system prompt |
+| `max_tokens` | integer | no | Default per profile, usually 1024 |
+| `temperature` | number | no | 0.0-1.0, default 0.0 |
+| `model_override` | string | no | Override profile's default model |
+| `timeout_ms` | integer | no | Per-call timeout, default 60000 |
+| `metadata` | object | no | Free-form, echoed back in reply |
 
-- **`request_id` is a UUID.** RPG can generate UUIDs via `SYSTOOLS.GENERATE_UUID` or via the system API `_GENUUID`. UUIDs are required because PHP uses them for log correlation and deduplication.
-- **`metadata` is opaque on purpose.** PHP doesn't parse it, doesn't validate it, just echoes it back. This is the field RPG uses to remember what request this was — line ID, batch ID, anything. Putting these in `metadata` instead of as top-level fields means PHP doesn't need to know about K3S concepts.
-- **`profile_ref` is a string lookup, not the profile contents.** The profile (provider, model, key) lives in a DB2 table, not in the message. Sending it in the message would put API keys on the queue, which is a leak risk. The reference is a small, safe identifier; PHP looks up the actual profile when it needs it.
+### Field-by-field rationale
+
+**`version`.** First field, fixed format. Future contract revisions can read this to know how to parse the rest. Cheap insurance against the inevitable need to change the format.
+
+**`request_id`.** Required. Used for log correlation across RPG, PHP, and any external services. Must be unique per request. UUIDs are convenient; sequential numbers from a database also work.
+
+**`customer`.** Identifies which customer this request is for. PHP uses this to scope profile lookups, rate limit buckets, and usage logging.
+
+**`profile_ref`.** Points at a row in `K3SAI.AI_PROFILE`. PHP resolves the actual provider, model, and key from this. RPG doesn't need to know what the resolution is.
+
+**`reply_queue`.** The address to send the response to. This is what makes the "request-reply" pattern work over a fire-and-forget queue.
+
+**`prompt`.** The text that goes into the AI's user-message slot. Built by the customer's `AIPRE` logic.
+
+**`system_prompt`.** Optional. Some use cases need a system-level instruction; others don't. Profile defaults usually cover this.
+
+**`max_tokens`, `temperature`, `model_override`, `timeout_ms`.** Optional overrides for the profile's defaults. Most calls don't override anything.
+
+**`metadata`.** Free-form. RPG puts whatever it needs (row ID, batch ID, etc.) and PHP echoes it back unchanged. The architectural rule: PHP never inspects `metadata`. It's RPG's space.
 
 ---
 
-## Reply queue message format (PHP → RPG)
+## The reply format — success
 
-Every message on a reply queue is a single JSON object. The fields are:
-
-### Always present
-
-| Field | Type | Description |
-|:---|:---|:---|
-| `version` | string | Matches the request version. `"1.0"` in V1. |
-| `request_id` | string | Echoed from the request. |
-| `status` | string | One of: `"success"`, `"error"`, `"timeout"`. |
-| `metadata` | object | Echoed unchanged from the request's `metadata`. |
-
-### Present when `status == "success"`
-
-| Field | Type | Description |
-|:---|:---|:---|
-| `response` | string | The AI's response text. |
-| `model_used` | string | The actual model that served the request (may differ from requested if profile overrode). |
-| `tokens_in` | integer | Input tokens billed. |
-| `tokens_out` | integer | Output tokens billed. |
-| `latency_ms` | integer | Wall-clock time from PHP receiving the request to PHP getting the response. |
-| `finish_reason` | string | Provider-normalized: `"stop"`, `"length"`, `"content_filter"`, `"other"`. |
-
-### Present when `status == "error"` or `"timeout"`
-
-| Field | Type | Description |
-|:---|:---|:---|
-| `error_code` | string | Stable code for programmatic handling. See below. |
-| `error_message` | string | Human-readable description. Safe to log. |
-| `provider_status` | integer | If applicable — the HTTP status from the provider (e.g., 429, 500). |
-| `attempts` | integer | How many times PHP retried before giving up. |
-
-### Error codes
-
-V1 defines these `error_code` values:
-
-| Code | Meaning |
-|:---|:---|
-| `INVALID_REQUEST` | The request itself was malformed (missing required field, bad JSON, unknown profile_ref). |
-| `PROFILE_NOT_FOUND` | `profile_ref` doesn't resolve to a known profile. |
-| `PROFILE_DISABLED` | Profile exists but is marked inactive. |
-| `RATE_LIMITED` | Provider returned 429 and retries were exhausted. |
-| `PROVIDER_ERROR` | Provider returned 5xx and retries were exhausted. |
-| `PROVIDER_AUTH` | Provider returned 401 — bad or revoked API key. |
-| `TIMEOUT` | `timeout_ms` exceeded before the provider responded. |
-| `INTERNAL` | Something went wrong inside the PHP worker. The most general code; should be rare. |
-
-RPG decides what to do per code. Most shops will handle `RATE_LIMITED` and `PROVIDER_ERROR` as retryable (re-queue the work unit later) and the rest as permanent (mark the row as errored and move on).
-
-### Example: success
+JSON sent from PHP to the named reply queue.
 
 ```json
 {
   "version": "1.0",
   "request_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "success",
-  "response": "OK",
+  "response": "...",
   "model_used": "claude-sonnet-4-5",
   "tokens_in": 487,
-  "tokens_out": 2,
+  "tokens_out": 312,
   "latency_ms": 842,
-  "finish_reason": "stop",
-  "metadata": {
-    "batch_id": "BATCH_20260507_0001",
-    "line_id": 4271,
-    "po_number": "PO123456"
-  }
+  "finish_reason": "end_turn",
+  "metadata": { "row_id": 12345, "batch_id": "..." }
 }
 ```
 
-### Example: rate limited
+| Field | Type | Notes |
+|:---|:---|:---|
+| `version` | string | `"1.0"` |
+| `request_id` | string | Echo of request's `request_id` |
+| `status` | string | `"success"` |
+| `response` | string | The AI's text response, content of `content[0].text` from Anthropic |
+| `model_used` | string | Actual model that processed the request |
+| `tokens_in` | integer | Input tokens consumed |
+| `tokens_out` | integer | Output tokens produced |
+| `latency_ms` | integer | Wall-clock time spent in the AI call |
+| `finish_reason` | string | Why the AI stopped — `end_turn`, `max_tokens`, etc. |
+| `metadata` | object | Echo of request's `metadata` |
+
+### Why "response" is a single string, not the full provider envelope
+
+We deliberately don't pass through Anthropic's full response envelope. The `content` array, the `role` field, the various message-shape complexities — none of that crosses to RPG. What RPG gets is the AI's text, normalized.
+
+This is a design choice. Pro: RPG doesn't have to track provider-specific response shapes. Con: if the provider ever returns multi-part content (text + images + function calls), this format can't represent that. For the V1 contract, the simplification is worth it. We'll evolve when we need to.
+
+---
+
+## The reply format — error
 
 ```json
 {
@@ -294,151 +247,217 @@ RPG decides what to do per code. Most shops will handle `RATE_LIMITED` and `PROV
   "request_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "error",
   "error_code": "RATE_LIMITED",
-  "error_message": "Provider returned 429 after 5 retries",
-  "provider_status": 429,
+  "error_message": "Anthropic rate limited after 5 attempts",
   "attempts": 5,
-  "metadata": {
-    "batch_id": "BATCH_20260507_0001",
-    "line_id": 4271,
-    "po_number": "PO123456"
-  }
+  "metadata": { "row_id": 12345, "batch_id": "..." }
 }
 ```
 
-### Example: timeout
+| `status` | When |
+|:---|:---|
+| `success` | Provider returned 2xx and response parsed |
+| `error` | All retries exhausted or non-retryable failure |
 
-```json
-{
-  "version": "1.0",
-  "request_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "timeout",
-  "error_code": "TIMEOUT",
-  "error_message": "Provider did not respond within 30000ms",
-  "attempts": 1,
-  "metadata": {
-    "batch_id": "BATCH_20260507_0001",
-    "line_id": 4271,
-    "po_number": "PO123456"
-  }
+| `error_code` | Meaning |
+|:---|:---|
+| `RATE_LIMITED` | Provider returned 429 after retries exhausted |
+| `PROVIDER_AUTH` | 401/403 — key invalid |
+| `PROVIDER_ERROR` | 5xx after retries exhausted |
+| `TIMEOUT` | Client-side timeout, provider didn't respond |
+| `INVALID_REQUEST` | Provider returned 400 — malformed request |
+| `PROFILE_NOT_FOUND` | `profile_ref` doesn't resolve |
+| `INTERNAL` | Worker crashed/bug |
+
+`attempts` tells RPG how many tries the worker made before giving up. Useful for batch-level observability.
+
+---
+
+## How PHP reads requests
+
+The reference pattern, in PHP:
+
+```php
+$sql = "SELECT MESSAGE_DATA_UTF8 
+          FROM TABLE(QSYS2.RECEIVE_DATA_QUEUE(
+            DATA_QUEUE         => ?,
+            DATA_QUEUE_LIBRARY => ?,
+            REMOVE             => 'YES',
+            WAIT_TIME          => 30
+          ))";
+
+$stmt = db2_prepare($conn, $sql);
+db2_execute($stmt, [$queueName, $queueLibrary]);
+$row = db2_fetch_assoc($stmt);
+
+if ($row && !empty($row['MESSAGE_DATA_UTF8'])) {
+    $request = json_decode($row['MESSAGE_DATA_UTF8'], true, 512, JSON_THROW_ON_ERROR);
 }
 ```
 
----
+Three things to notice:
 
-## Correlation and ordering
+**`SELECT MESSAGE_DATA_UTF8`** — not `MESSAGE_DATA`. The UTF-8 column.
 
-A few subtle properties that matter:
+**Parameter `REMOVE`** — not `REMOVE_MESSAGE`. The actual parameter name expected by the function.
 
-**One request, one response.** PHP guarantees that for every well-formed request it accepts off AI_OUT_QUEUE, exactly one response is written to the named reply queue — regardless of whether the call succeeded, errored, or timed out. The RPG worker can `RCVDTAQ` from its reply queue with confidence that something will arrive.
+**`WAIT_TIME => 30`** — PHP blocks for up to 30 seconds. If a message arrives, the call returns immediately with the message. If 30 seconds pass with no message, the call returns empty and PHP loops to call again.
 
-**Request_id correlation is the safety net, not the primary mechanism.** Because each RPG worker has its own reply queue and processes one row at a time, the response on the queue is, by construction, the response to the request the worker is waiting for. The request_id is there for log correlation and as a sanity check — RPG should still verify that the response's request_id matches the one it sent, and treat a mismatch as a serious error.
-
-**FIFO is preserved within a reply queue.** Because RPG workers process one row at a time, this is mostly academic — there's only one in-flight request per worker. But if you ever build a worker that pipelines (sends 2-3 requests before waiting for the first response), FIFO ordering is your friend.
-
-**Reply queues are not shared.** Two RPG workers must never share a reply queue. The contract assumes one consumer per reply queue, period.
+During the wait, PHP uses zero CPU. The OS handles the suspend and wakeup at the kernel level.
 
 ---
 
-## What's deliberately not in the contract
+## How PHP sends replies
 
-The contract is small on purpose. These things live elsewhere:
+```php
+$sql = "CALL QSYS2.SEND_DATA_QUEUE_UTF8(
+            MESSAGE_DATA       => ?,
+            DATA_QUEUE         => ?,
+            DATA_QUEUE_LIBRARY => ?
+        )";
+$stmt = db2_prepare($conn, $sql);
+db2_execute($stmt, [
+    json_encode($reply),
+    $replyQueue['name'],
+    $replyQueue['library'],
+]);
+```
 
-- **Authentication, encryption, key rotation.** Handled by the AI profile lookup, not by message fields. Covered in [AI provider concerns]({% link providers/index.md %}).
-- **Rate limit fairness across customers.** Lives in the PHP worker, invisible to the contract. Covered in [AI provider concerns]({% link providers/index.md %}).
-- **Logging, monitoring, observability.** Out-of-band of the contract. Covered in [Operating in production]({% link operations/index.md %}).
-- **Prompt construction and response parsing.** Owned by RPG. The contract carries the prompt as opaque string and the response as opaque string. What goes inside is not the contract's business.
-- **Batch coordination, work distribution, completion detection.** Lives in WORK_QUEUE and the RPG worker pool, not in the AI contract.
+**`SEND_DATA_QUEUE_UTF8`** — the UTF-8 variant. Stores the bytes as UTF-8 so RPG can read them back cleanly.
+
+Parameter order: `MESSAGE_DATA` first, then `DATA_QUEUE`, then `DATA_QUEUE_LIBRARY`. (Different from the receive procedure's parameter order — using named arguments avoids ambiguity.)
+
+---
+
+## How RPG sends requests
+
+```rpg
+dcl-s requestJson varchar(4000) ccsid(*utf8);
+
+// ... build request data structure ...
+
+data-gen request 
+         %data(requestJson : 'noprefix=request_') 
+         %gen('YAJL/YAJLDTAGEN');
+
+exec sql 
+  call qsys2.send_data_queue_utf8(
+    MESSAGE_DATA       => :requestJson,
+    DATA_QUEUE         => 'AIOUTQ',
+    DATA_QUEUE_LIBRARY => 'K3SAI'
+  );
+```
+
+The `ccsid(*utf8)` declaration on the JSON variable is what makes RPG handle the conversion correctly when binding `:requestJson` to the SQL parameter.
+
+---
+
+## How RPG receives replies
+
+```rpg
+dcl-s responseJson varchar(4000) ccsid(*utf8);
+
+exec sql 
+  select MESSAGE_DATA_UTF8 
+    into :responseJson
+    from table(qsys2.receive_data_queue(
+      DATA_QUEUE         => :replyQueue,
+      DATA_QUEUE_LIBRARY => :replyLib,
+      REMOVE             => 'YES',
+      WAIT_TIME          => 60
+    ));
+```
+
+Same pattern as PHP receive: select `MESSAGE_DATA_UTF8`, parameter `REMOVE`, named arguments.
+
+---
+
+## Reply queue naming
+
+Conventions matter, because reply queue names cross the contract.
+
+The pattern: `RPLY_{worker_id_zero_padded}` in the customer's library.
+
+Examples: `RPLY_000001`, `RPLY_000023`, `RPLY_000150`.
+
+Why zero-padding to six digits:
+
+- Allows up to 999,999 worker IDs without restructuring
+- Sortable lexically when listing queues
+- Predictable length for parsing
+
+The library is the customer's `*_5DTA`. Each worker creates its queue at startup, and deletes it at shutdown. If a worker crashes, an orphaned queue may remain — there's a daily cleanup job that finds and removes them.
+
+Worth deciding for a real shop: which option fits K3S conventions best — RPLY_{id}, RPLY_{job_name}, or some other pattern. The contract works with any of them as long as both sides agree.
+
+---
+
+## Maximum message size
+
+V1 limit: 64 KB (the `MAXLEN(64512)` on the queue).
+
+For the demo, every message is 500-1500 bytes. For production purchasing prompts, expect 5-30 KB depending on how much vendor history and policy text is included. Still well under the limit.
+
+If a prompt approaches the limit, switch to **prompt-by-reference**:
+
+1. Store the actual prompt in a DB2 CLOB table keyed by request_id.
+2. Send `{"request_id": "...", "prompt_ref": "DEMOLIB.PROMPTS.123"}` on the queue.
+3. PHP fetches the prompt from DB2 using the reference, then makes the AI call.
+4. PHP sends the response back through the queue normally.
+
+Adds a DB lookup per call but removes the size ceiling. Worth implementing if and when prompts approach 64 KB. Not in V1.
+
+---
+
+## Error handling principles
+
+The contract guarantees a reply for every accepted request. Even if everything goes wrong, RPG gets *some* reply with a status code it can act on. This is what lets RPG rely on its `RECEIVE_DATA_QUEUE` call without timeouts and retry logic.
+
+Three cases produce error replies:
+
+1. **Provider failure that retries didn't fix.** Status `error`, error_code per the table above. Worker logs the failure but doesn't try further.
+2. **Configuration failure.** Bad profile, bad key, missing data. Worker recognizes these don't benefit from retry, returns immediately with `PROFILE_NOT_FOUND` or `PROVIDER_AUTH`.
+3. **Internal worker bug.** Something the worker didn't anticipate. Status `error`, error_code `INTERNAL`. RPG should log these and alert ops.
+
+What the worker never does: silent failure. Every request gets a reply. RPG never has to wonder whether its request got lost.
 
 ---
 
 ## Versioning the contract
 
-The `version` field is `"1.0"` for the contract described in this chapter. It will change.
+The `version` field is `"1.0"` today. Future versions of this contract will increment. The rules:
 
-### Compatible (minor) changes — version becomes `"1.1"`, `"1.2"`, etc.
+- **Major version bump (`2.0`)** for breaking changes — fields removed, semantics changed, error codes redefined.
+- **Minor version bump (`1.1`)** for additive changes — new optional fields, new error codes.
+- **Both sides must coordinate on major version changes.** Old PHP can't speak `2.0`; old RPG can't read `2.0` replies.
+- **Minor changes are backward-compatible.** Old code ignores fields it doesn't recognize.
 
-These don't break old senders or old receivers:
+The `version` field at the top of every message lets each side check compatibility. PHP can refuse to process a `2.0` request if it's still on `1.0`. RPG can detect a `2.0` reply and warn ops.
 
-- Adding new optional fields with defaults.
-- Adding new error codes (old code on the receive side should treat unknown codes as `INTERNAL` until updated).
-- Adding new `finish_reason` values (same fallback rule).
-- Loosening validation (e.g., accepting longer strings).
+This is light governance. Production deserves more (a contract version registry, automated compatibility checks). V1 doesn't need it.
 
-PHP and RPG can be upgraded independently for minor versions. Old PHP can serve new RPG (ignoring fields it doesn't know); new PHP can serve old RPG (defaulting fields RPG doesn't send).
+---
 
-### Incompatible (major) changes — version becomes `"2.0"`
+## What's deliberately not in this V2 contract
 
-These do break compatibility:
+- **Streaming responses.** Each reply is a single message, not a stream. Future versions may support streaming via multiple queue messages with sequence numbers.
+- **Multi-part content (text + images + function calls).** Reply's `response` is a single string. Multi-modal isn't supported.
+- **Compression.** No compressing the JSON payload. Could be added if message size becomes a concern.
+- **Encryption inside the message.** The queue is on the same IBM i; we trust the local environment. If cross-system queues become a thing, encryption joins the contract.
+- **Authentication of sender.** Any program with `*USE` on the queue can send. Production multi-tenancy depends on library-list isolation, not message authentication.
 
-- Removing fields.
-- Renaming fields.
-- Changing field types (string to integer, etc.).
-- Changing the meaning of an existing value.
-
-For major changes, the migration plan is:
-
-1. Deploy new PHP that accepts both `"1.x"` and `"2.0"` requests, writes responses matching the request version.
-2. Migrate RPG to send `"2.0"`.
-3. After all RPG is migrated, deploy newer PHP that drops `"1.x"` support.
-
-Don't undertake major version changes lightly. Most evolution should be minor.
+Each is a real direction for the contract to grow. None is needed for V1.
 
 ---
 
 ## Open for discussion
 
-These are the V1 decisions we're least confident about. Worth working through with your team.
+V1 calls in this contract that are worth revisiting once we have real-shop experience:
 
-### Library naming
-
-We've used `K3SAI` as the working name for the K3S admin library. Other candidates: `K3SCMN` (common), `K3SOPS` (operations), `K3SSYS` (system). What naming convention does your shop already use for cross-customer admin libraries?
-
-### Reply queue naming
-
-`RPLY_{worker_id}` is fine, but worker_id needs to be unique across all batches running concurrently. Options:
-
-- **Globally unique worker IDs** assigned by a counter in a shared K3S admin table. Simple but introduces a hot row.
-- **Per-batch worker IDs** plus the batch_id in the queue name (e.g., `RPLY_BATCH001_007`). More cumbersome.
-- **Job-name-based** (e.g., `RPLY_{job_name}_{job_number}`). Naturally unique but uglier.
-
-Worth deciding: which option fits K3S conventions best.
-
-### Maximum message size
-
-2 MB feels generous, but we haven't measured what real K3S prompts look like with full product context embedded. If actual prompts are in the 50KB range, 2 MB is overkill. If they're approaching 1 MB, we should bump it.
-
-If a prompt would exceed the queue's max length, the alternative is "prompt-by-reference": store the prompt in a DB2 CLOB table keyed by request_id, send only the reference on the queue. Adds a DB2 lookup but removes the size ceiling. Worth implementing if we ever need it; not needed in V1.
-
-### Timeout default
-
-`timeout_ms: 60000` (60 seconds) is the V1 default. Cloud AI providers usually respond in under 10 seconds; on-premises models can be slower. This is the timeout *PHP enforces locally* — it doesn't change provider-side behavior. If the provider takes 90 seconds, PHP times out at 60 and returns; the provider's response (if it eventually arrives) is discarded.
-
-Is 60 seconds the right default? Should it be 30? 120? Worth discussing.
-
-### Error code granularity
-
-The eight error codes above are a starting point. We may want to split `PROVIDER_ERROR` into transient vs. permanent (a 503 vs. a 400 are very different). Or add `CONTENT_FILTERED` for cases where the provider refuses to respond. Adding codes is a minor version change, so we don't need to settle this in V1.
-
-### Should `system_prompt` be in the request or the profile?
-
-Argument for request: same prompt template can vary system behavior per-call.
-
-Argument for profile: keeps RPG simpler; the profile knows the role.
-
-V1 puts it in the request as optional (with profile fallback). Open to flipping that.
-
----
-
-## What V1 gives you
-
-If both halves implement what's specified above:
-
-- An RPG developer can write a worker against the V1 contract without seeing the PHP.
-- A PHP developer can write a worker against the V1 contract without seeing the RPG.
-- Either side can be tested in isolation by stubbing the other (a tiny CL program that puts canned messages on the queue; a tiny PHP script that reads from the queue and writes a fake response).
-- Either side can be replaced or rewritten without touching the other, as long as the contract is preserved.
-
-That's the test of whether the contract is right. If it doesn't enable independent development, it's not a contract — it's a coupling pretending to be one.
+- **Reply queue naming.** Pattern is `RPLY_{worker_id}` zero-padded; zero-padding length and exact format are open.
+- **Maximum message size.** 64 KB is generous for demos but tight for production prompts. May want to standardize prompt-by-reference earlier.
+- **The `metadata` field's "free-form" promise.** Free-form is convenient but means PHP can never understand what's in there. May want to formalize standard sub-fields (request source, debug tag, etc.).
+- **Whether to include a `priority` field.** For systems that want some requests to jump the queue. Adds complexity to PHP's pull logic.
+- **`error_code` enum extensibility.** New providers may have new error categories. Need a way to extend without breaking deserialization on the RPG side.
 
 ---
 

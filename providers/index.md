@@ -1,13 +1,13 @@
 ---
 title: AI provider concerns
-nav_order: 13
+nav_order: 10
 has_children: false
 ---
 
 # AI provider concerns
 {: .no_toc }
 
-**Status:** Draft V1
+**Status:** Draft V2 V2
 
 This is the chapter where the AI part stops being abstract. It covers how the worker actually talks to providers, how customers' API keys get stored without leaking, how K3S can offer both BYOK and hosted tiers without writing two different workers, how rate limits get enforced fairly across customers, and what the per-call cost story looks like.
 

@@ -7,7 +7,7 @@ has_children: false
 # Quickstart 2 — Five workers in parallel (RPG + PHP)
 {: .no_toc }
 
-**Status:** Draft V2
+**Status:** Draft V3
 
 This chapter takes the demo from [Quickstart 1 (RPG + PHP)]({% link quickstart-1/index.md %}) and runs five RPG workers against the same five rows, in parallel. Wall-clock time drops from "five sequential round trips" to "one round trip happening five times at once."
 
@@ -491,6 +491,8 @@ The parallelism dividend is ~3-4x. With more rows it scales further, bounded by 
 - Backpressure and queue depth monitoring
 - Worker pool sizing
 - Structured logging and usage tracking
+- **Batch isolation on `WORK_QUEUE`.** This demo runs one batch at a time. If two batches ran simultaneously against the same `WORK_QUEUE`, a worker submitted for batch A could pull a work unit belonging to batch B, and batch A's metadata accounting would be wrong. Production RPG workers should validate the batch_id on each work unit and re-queue if it doesn't match their assigned batch. See [The RPG worker pool]({% link rpg-pool/index.md %}) for the production pattern.
+- **Reply queue cleanup if a worker crashes.** The demo's worker creates `RPLY_*` at startup and deletes it at shutdown. If the worker crashes between those two points, the queue is orphaned. For the demo, you can `DLTDTAQ` it manually. Production needs a daily cleanup job that finds queues belonging to no-longer-running jobs and removes them. See [Operating in production]({% link operations/index.md %}).
 
 Each is covered in later chapters.
 

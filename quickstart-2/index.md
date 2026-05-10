@@ -7,13 +7,13 @@ has_children: false
 # Quickstart 2 — Five workers in parallel (RPG + PHP)
 {: .no_toc }
 
-**Status:** Draft V1 — code untested on Calvin yet
+**Status:** Draft V2
 
 This chapter takes the demo from [Quickstart 1 (RPG + PHP)]({% link quickstart-1/index.md %}) and runs five RPG workers against the same five rows, in parallel. Wall-clock time drops from "five sequential round trips" to "one round trip happening five times at once."
 
 The key insight: **parallelism falls out of the architecture, not from new code**. The PHP worker doesn't change. The contract doesn't change. Most of the RPG doesn't change. What changes is small enough that you can do it in half an hour.
 
-If you've read [Quickstart 2 (RPG only)]({% link quickstart-2-rpg/index.md %}), you've already seen this same lesson once — five workers using SQL claiming to coordinate, no queue between them needed for V1. This chapter applies the same parallelism pattern to the RPG+PHP architecture, with one notable addition: **a `WORK_QUEUE` between the batch initiator and the workers**, because the K3S architecture commits to using queues as the work-distribution mechanism for production.
+If you've read [Quickstart 2 (RPG only)]({% link quickstart-2-rpg/index.md %}), you've already seen this same lesson once — five workers using SQL claiming to coordinate. This chapter applies the same parallelism pattern to the RPG+PHP architecture, with one notable addition: **a `WORK_QUEUE` between the batch initiator and the workers**, because the K3S architecture commits to using queues as the work-distribution mechanism for production.
 
 ## Table of contents
 {: .no_toc .text-delta }
@@ -44,10 +44,10 @@ Three changes:
 What's unchanged:
 
 - **`worker.php`** is unchanged. The PHP worker is shared infrastructure.
-- **`DEMOPRE`** is unchanged. Pre-AI logic doesn't depend on which worker is calling it.
+- **`DEMOPRE`** is unchanged.
 - **`DEMOPST`** has one small change: takes a `worker_id` parameter so each worker writes its own ID.
 - **The data queue contract** is unchanged.
-- **`AI_OUT_QUEUE`** is unchanged. All five workers write to the same queue; PHP serves any of them.
+- **`AIOUTQ`** is unchanged. All five workers write to the same queue; PHP serves any of them.
 
 ---
 
@@ -81,7 +81,7 @@ What's unchanged:
    │                  │  │    │  │    │  │    │  │    │
    │  RCV WORK_QUEUE  │  │... │  │... │  │... │  │... │
    │  call DEMOPRE    │  │    │  │    │  │    │  │    │
-   │  send AI_OUT     │  │    │  │    │  │    │  │    │
+   │  send AIOUTQ     │  │    │  │    │  │    │  │    │
    │  RCV RPLY_000001 │  │    │  │    │  │    │  │    │
    │  call DEMOPST    │  │    │  │    │  │    │  │    │
    └────────┬─────────┘  └─┬──┘  └─┬──┘  └─┬──┘  └─┬──┘
@@ -89,7 +89,7 @@ What's unchanged:
             └──────────────┼───────┼───────┼───────┘
                            ▼       ▼       ▼
                    ┌────────────────────┐
-                   │   AI_OUT_QUEUE     │  (in K3SAI)
+                   │      AIOUTQ        │  (in K3SAI)
                    └─────────┬──────────┘
                              │
                              ▼
@@ -107,15 +107,14 @@ Five RPG workers, all running concurrently. Each has its own reply queue (`RPLY_
 ```
 CRTDTAQ DTAQ(DEMOLIB/WORK_QUEUE) +
         TYPE(*STD) +
-        MAXLEN(500) +
+        MAXLEN(64512) +
         SEQ(*FIFO) +
         FORCE(*NO) +
         AUT(*USE) +
-        CCSID(1208) +
         TEXT('Demo work distribution queue')
 ```
 
-Smaller `MAXLEN` than `AI_OUT_QUEUE` because work unit messages are tiny.
+Same parameters pattern as `AIOUTQ`. `MAXLEN(64512)` is the maximum allowed for a standard data queue. No `CCSID` parameter on `CRTDTAQ` (it doesn't exist). UTF-8 handling happens via the `_UTF8` variants of the SQL procedures, not via the queue itself.
 
 ---
 
@@ -228,9 +227,9 @@ end-pr;
 dcl-s workerId    int(10);
 dcl-s rowId       int(10);
 dcl-s prompt      varchar(2000);
-dcl-s requestJson varchar(4000);
-dcl-s responseJson varchar(4000);
-dcl-s workMessage varchar(500);
+dcl-s requestJson varchar(4000) ccsid(*utf8);
+dcl-s responseJson varchar(4000) ccsid(*utf8);
+dcl-s workMessage varchar(500) ccsid(*utf8);
 dcl-s requestId   varchar(36);
 dcl-s replyQueue  char(15);
 dcl-s replyLib    char(10) inz('DEMOLIB');
@@ -265,22 +264,23 @@ workerId   = %int(%trim(pInWorkerId));
 replyQueue = 'RPLY_' + %char(workerId);
 
 crtCmd = 'CRTDTAQ DTAQ(DEMOLIB/' + %trim(replyQueue) + ') +
-          TYPE(*STD) MAXLEN(2000000) +
-          SEQ(*FIFO) CCSID(1208) +
+          TYPE(*STD) MAXLEN(64512) +
+          SEQ(*FIFO) +
           AUT(*USE) +
           TEXT(''Demo reply queue worker ' + %char(workerId) + ''')';
 QCMDEXC(crtCmd : 500);
 
 dou done;
 
+  // Read from WORK_QUEUE (UTF-8 column, REMOVE parameter, WAIT_TIME 5s)
   exec sql
-    select MESSAGE_DATA
+    select MESSAGE_DATA_UTF8
       into :workMessage
       from table(qsys2.receive_data_queue(
         DATA_QUEUE         => 'WORK_QUEUE',
         DATA_QUEUE_LIBRARY => 'DEMOLIB',
-        WAIT_TIME          => 5,
-        REMOVE_MESSAGE     => 'YES'
+        REMOVE             => 'YES',
+        WAIT_TIME          => 5
       ));
 
   if sqlcode <> 0 or workMessage = '';
@@ -313,21 +313,23 @@ dou done;
            %data(requestJson : 'noprefix=request_')
            %gen('YAJL/YAJLDTAGEN');
 
+  // Send to AIOUTQ via UTF-8 procedure
   exec sql
-    call qsys2.send_data_queue(
+    call qsys2.send_data_queue_utf8(
       MESSAGE_DATA       => :requestJson,
       DATA_QUEUE         => 'AIOUTQ',
       DATA_QUEUE_LIBRARY => 'K3SAI'
     );
 
+  // Receive reply: UTF-8 column, REMOVE parameter, 60s wait
   exec sql
-    select MESSAGE_DATA
+    select MESSAGE_DATA_UTF8
       into :responseJson
       from table(qsys2.receive_data_queue(
         DATA_QUEUE         => :replyQueue,
         DATA_QUEUE_LIBRARY => :replyLib,
-        WAIT_TIME          => 60,
-        REMOVE_MESSAGE     => 'YES'
+        REMOVE             => 'YES',
+        WAIT_TIME          => 60
       ));
 
   if sqlcode = 0 and responseJson <> '';
@@ -352,26 +354,32 @@ return;
 
 The shape is the same loop: receive work, build prompt, send to AI, wait for reply, process. What changed: "receive work" now means pulling from `WORK_QUEUE`, and the reply queue name is parameterized.
 
+Note throughout: data queue receive uses `MESSAGE_DATA_UTF8` and parameter `REMOVE`. Send uses `send_data_queue_utf8`. Variables holding queue payloads are declared `ccsid(*utf8)` so RPG handles encoding correctly.
+
 ### `DEMOSTART` — populate WORK_QUEUE, submit 5 workers
 
 ```cl
 PGM
 
 DCL VAR(&BATCH_ID) TYPE(*CHAR) LEN(20)
-DCL VAR(&MSG)      TYPE(*CHAR) LEN(100)
 
-RTVSYSVAL  SYSVAL(QDATETIME) RTNVAR(&BATCH_ID)
+/* Populate WORK_QUEUE with one message per pending row.
+   Calling SEND_DATA_QUEUE_UTF8 in a loop from a small RPG initialization
+   program is the standard pattern. Below is one inline approach using RUNSQL
+   that may or may not work on your IBM i version — if it doesn't, write a
+   small INITQ program in RPG that calls SEND_DATA_QUEUE_UTF8 in a cursor loop. */
 
-/* Populate WORK_QUEUE with rows */
-RUNSQL SQL('INSERT INTO TABLE(QSYS2.SEND_DATA_QUEUE_INFO( +
-            DATA_QUEUE => ''WORK_QUEUE'', +
-            DATA_QUEUE_LIBRARY => ''DEMOLIB'')) +
-            SELECT ''{"row_id":'' || +
-                   CAST(ROW_ID AS VARCHAR(10)) || +
-                   '',"batch_id":"DEMO_BATCH_2"}'' +
-            FROM DEMOLIB/DEMO_INPUT +
-            WHERE PROCESSED_AT IS NULL +
-            ORDER BY ROW_ID') +
+RUNSQL SQL('BEGIN +
+  FOR r AS SELECT ROW_ID FROM DEMOLIB/DEMO_INPUT +
+           WHERE PROCESSED_AT IS NULL ORDER BY ROW_ID DO +
+    CALL QSYS2.SEND_DATA_QUEUE_UTF8( +
+      MESSAGE_DATA       => +
+        ''{"row_id":'' || CAST(r.ROW_ID AS VARCHAR(10)) || +
+        '',"batch_id":"DEMO_BATCH_2"}'', +
+      DATA_QUEUE         => ''WORK_QUEUE'', +
+      DATA_QUEUE_LIBRARY => ''DEMOLIB''); +
+  END FOR; +
+END') +
        COMMIT(*NONE)
 
 /* Submit 5 workers */
@@ -396,13 +404,12 @@ SBMJOB CMD(CALL PGM(DEMOLIB/DEMOWRK) PARM('5'))         +
        INLLIBL(DEMOLIB K3SAI QGPL QTEMP)                +
        LOG(4 00 *NOLIST)
 
-CHGVAR VAR(&MSG) VALUE('Submitted 5 workers; 5 work units queued.')
-SNDPGMMSG MSG(&MSG)
+SNDPGMMSG MSG('Submitted 5 workers; 5 work units queued.')
 
 ENDPGM
 ```
 
-The `RUNSQL` to populate `WORK_QUEUE` uses `QSYS2.SEND_DATA_QUEUE_INFO` as a target of `INSERT` — a way to send queue messages from SQL. If your IBM i version doesn't support this pattern, the alternative is calling `QSYS2.SEND_DATA_QUEUE` from a small RPG initialization program.
+The `RUNSQL` block uses an SQL procedure (`BEGIN ... END`) to loop over candidate rows and call `SEND_DATA_QUEUE_UTF8` for each. If your IBM i version doesn't support that pattern in `RUNSQL`, write a small RPG initialization program that does the same loop in RPG and call it from CL.
 
 ### `worker.php` — unchanged
 
@@ -476,41 +483,7 @@ The parallelism dividend is ~3-4x. With more rows it scales further, bounded by 
 
 ---
 
-## Optional: a second PHP worker
-
-The PHP worker can handle five concurrent calls fine via Guzzle pool, but you can prove the architecture's symmetry by starting a second one:
-
-```
-cd /home/yourprofile/aidemo
-export ANTHROPIC_API_KEY="sk-ant-..."
-php worker.php
-```
-
-Now two PHP workers listen on `K3SAI/AIOUTQ`. FIFO ordering ensures one of them gets each message. M PHP workers × N RPG workers, both scaling independently, both connected only by the queue contract.
-
----
-
-## What you've learned
-
-What didn't change:
-
-- The PHP worker.
-- The data queue contract.
-- The AI provider.
-- `DEMOPRE`.
-- The architectural shape.
-
-What did change:
-
-- One CL program (populate queue, submit 5 jobs).
-- One RPG worker (read from queue, accept worker_id).
-- One small `DEMOPST` change.
-
-That's it. Parallelism wasn't engineered — it was already there, latent, and we just had to invoke it.
-
----
-
-## What's still not in this V1 demo
+## What's still not in this V2 demo
 
 - Per-customer AI profiles (hardcoded in worker)
 - Multi-tenant library list resolution

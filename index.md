@@ -62,24 +62,6 @@ If you're new to the guide, read in this order:
 
 After that, the chapters can be read in any order based on what you're building next.
 
-## Status
-
-Last updated **May 7, 2026**.
-
-| Chapter | Status |
-|:---|:---|
-| [Foundations]({% link foundations/index.md %}) | V1 |
-| [Quickstart — One worker]({% link quickstart-1/index.md %}) | V1 |
-| [Quickstart — Five workers]({% link quickstart-2/index.md %}) | V1 |
-| [Architecture overview]({% link architecture/index.md %}) | V1 |
-| [The data queue contract]({% link contract/index.md %}) | V1 |
-| [The PHP worker]({% link php-worker/index.md %}) | V1 |
-| [The RPG worker pool]({% link rpg-pool/index.md %}) | V1 |
-| [Multi-tenancy]({% link multi-tenancy/index.md %}) | V1 |
-| [AI provider concerns]({% link providers/index.md %}) | V1 |
-| [Operating in production]({% link operations/index.md %}) | V1 |
-| [Reference]({% link reference/index.md %}) | V1 |
-
 ## Why we're publishing this
 
 Three honest reasons:

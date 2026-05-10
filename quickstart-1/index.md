@@ -7,7 +7,7 @@ has_children: false
 # Quickstart 1 — One worker, one round trip (RPG + PHP)
 {: .no_toc }
 
-**Status:** Draft V2
+**Status:** Draft V3
 
 This is the same demo as [Quickstart 1 (RPG only)]({% link quickstart-1-rpg/index.md %}), but with PHP added as the delivery layer between RPG and the AI provider. If you haven't read the pure-RPG version and the [Why PHP]({% link why-php/index.md %}) chapter that follows it, do those first — this chapter assumes you've seen the pure-RPG round trip work and have read the case for adding PHP.
 
@@ -809,6 +809,8 @@ rm -rf /opt/k3s/ai-worker
 - **Production-shape PHP worker code.** The PHP we're running is ~150 lines. The production version is structured into classes (Provider, ProfileResolver, Logger, etc.). See [The PHP worker]({% link php-worker/index.md %}) for the production shape.
 - **Full V1 contract validation.** The PHP worker assumes well-formed requests. Production validates aggressively.
 - **AI profile resolution.** Provider, model, and key are hardcoded. Production looks them up per `profile_ref`.
+- **Reply queue cleanup if a worker crashes.** The demo's worker creates `RPLY_000001` at startup and deletes it at shutdown. If the worker crashes between those two points, the queue is orphaned. For the demo, you can `DLTDTAQ` it manually. Production needs a daily cleanup job that finds queues belonging to no-longer-running jobs and removes them. See [Operating in production]({% link operations/index.md %}).
+- **Recovery from missing replies.** The demo waits 60 seconds for a reply and marks the row `TIMEOUT` if none arrives. Production may want to retry, alert ops, or surface the problem to the user. The contract is the worker's commitment to send a reply, but RPG must always handle the case where the reply doesn't come (because PHP crashed, the IBM i rebooted, etc.).
 
 These are all topics covered in later chapters.
 

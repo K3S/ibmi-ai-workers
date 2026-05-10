@@ -7,7 +7,7 @@ has_children: false
 # Reference
 {: .no_toc }
 
-**Status:** Draft V1
+**Status:** Draft V2 V2
 
 Cheat sheets and quick-lookup material for things you'll need to find fast: the V1 contract message formats, common SQL queries, IBM i commands, error codes, environment variables, and the mental shortcuts that take a while to internalize but are obvious once you do.
 
@@ -203,27 +203,35 @@ SELECT BATCH_ID, STATUS, TOTAL_UNITS,
 
 ### Sending a message to a queue from SQL
 
+Use the UTF-8 variant when sending data that PHP will read (or anywhere JSON crosses the language boundary):
+
 ```sql
-CALL QSYS2.SEND_DATA_QUEUE(
+CALL QSYS2.SEND_DATA_QUEUE_UTF8(
   MESSAGE_DATA       => '...',
   DATA_QUEUE         => 'AIOUTQ',
   DATA_QUEUE_LIBRARY => 'K3SAI'
 );
 ```
 
+The non-UTF-8 form (`SEND_DATA_QUEUE`) stores data in the connection's CCSID (typically EBCDIC) and will produce garbled bytes when read from PHP or any UTF-8-native consumer.
+
 ### Receiving from a queue in SQL
 
 ```sql
-SELECT MESSAGE_DATA
+SELECT MESSAGE_DATA_UTF8
   FROM TABLE(QSYS2.RECEIVE_DATA_QUEUE(
     DATA_QUEUE         => 'AIOUTQ',
     DATA_QUEUE_LIBRARY => 'K3SAI',
-    WAIT_TIME          => 30,
-    REMOVE_MESSAGE     => 'YES'
+    REMOVE             => 'YES',
+    WAIT_TIME          => 30
   ));
 ```
 
-`WAIT_TIME` is in seconds. `0` = no wait, `-1` = wait forever, positive number = wait that long.
+Notes:
+
+- Select `MESSAGE_DATA_UTF8` (not `MESSAGE_DATA`) to get UTF-8 bytes regardless of job CCSID.
+- Parameter is `REMOVE` (not `REMOVE_MESSAGE`).
+- `WAIT_TIME` is in seconds. `0` = no wait, `-1` = wait forever, positive number = wait that long.
 
 ---
 
@@ -250,8 +258,8 @@ DSPJOBLOG JOB(123456/K3SAIWRK/AIWORKER1)       /* Specific job's log */
 
 ```
 CRTDTAQ DTAQ(K3SAI/AIOUTQ) TYPE(*STD)          +
-        MAXLEN(2000000) SEQ(*FIFO)              +
-        CCSID(1208) AUT(*USE)
+        MAXLEN(64512) SEQ(*FIFO)               +
+        AUT(*USE)
 DLTDTAQ DTAQ(K3SAI/AIOUTQ)
 DSPOBJD OBJ(K3SAI/AIOUTQ) OBJTYPE(*DTAQ) DETAIL(*FULL)
 WRKDTAQ DTAQ(K3SAI/*ALL)                       /* IBM i 7.4+ */
@@ -463,7 +471,7 @@ tail -f /QIBM/UserData/K3SAI/log/worker-*.log | jq .
 ### Test that PHP can talk to the AI provider
 
 ```sh
-cd /www/k3s-ai-worker
+cd /opt/k3s/ai-worker
 php -r 'require "vendor/autoload.php"; 
         $r = (new GuzzleHttp\Client())->get("https://api.anthropic.com"); 
         echo $r->getStatusCode();'
@@ -476,7 +484,7 @@ php -r 'require "vendor/autoload.php";
 Send:
 
 ```sh
-db2 -tx "CALL QSYS2.SEND_DATA_QUEUE(
+db2 -tx "CALL QSYS2.SEND_DATA_QUEUE_UTF8(
            MESSAGE_DATA       => 'test message',
            DATA_QUEUE         => 'AIOUTQ',
            DATA_QUEUE_LIBRARY => 'K3SAI'
@@ -486,11 +494,11 @@ db2 -tx "CALL QSYS2.SEND_DATA_QUEUE(
 Receive:
 
 ```sh
-db2 -tx "SELECT MESSAGE_DATA FROM TABLE(QSYS2.RECEIVE_DATA_QUEUE(
+db2 -tx "SELECT MESSAGE_DATA_UTF8 FROM TABLE(QSYS2.RECEIVE_DATA_QUEUE(
            DATA_QUEUE         => 'AIOUTQ',
            DATA_QUEUE_LIBRARY => 'K3SAI',
-           WAIT_TIME          => 1,
-           REMOVE_MESSAGE     => 'YES'
+           REMOVE             => 'YES',
+           WAIT_TIME          => 1
          ))"
 ```
 

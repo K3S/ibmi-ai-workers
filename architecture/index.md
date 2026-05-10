@@ -1,6 +1,6 @@
 ---
 title: Architecture overview
-nav_order: 8
+nav_order: 3
 has_children: false
 ---
 
@@ -31,8 +31,8 @@ The system has two long-lived components and several transient ones. Here's what
 
 ```
                   ┌───────────────────────────────────────────┐
-                  │ Application (Web Interface, green-screen, │
-                  │ whatever user clicks "run AI batch"       │
+                  │ Application (R7, green-screen, whatever)  │
+                  │   user clicks "run AI batch"              │
                   └────────────────┬──────────────────────────┘
                                    │
                                    ▼  CALL
@@ -209,7 +209,7 @@ There are two parallelism dimensions, and they're independent.
 
 **M — PHP worker count, and per-worker pool size.** PHP workers exist to keep the AI saturated. If a single PHP worker can hold 10 calls in flight via Guzzle pool, and your N RPG workers can produce up to N concurrent requests, you need M × pool_size ≥ N to avoid AI_OUT_QUEUE building up under steady state. Usually M = 4 to 8 is plenty.
 
-The math we recommend starting with: N = 50, M = 5, pool_size = 12. That gives you 60 PHP-side concurrent capacity for 50 RPG-side maximum demand, with margin. Tune from there based on what your AI provider and your IBM i actually do under load.
+The math we recommend starting with: N = 50, M = 5, pool_size = 10-12. That gives you 50-60 PHP-side concurrent capacity for 50 RPG-side maximum demand, with margin. Tune from there based on measurement: if PHP workers are saturating their pools and the AI provider isn't rate-limiting you, increase pool_size first (up to 30+ is achievable with a healthy IBM i and a well-behaved provider). If the AI provider is rate-limiting you, increasing pool_size doesn't help — fix the rate limit budget instead.
 
 The natural backpressure is the elegant part: RPG workers are self-throttling. Each one can only be processing one row at a time, and it's waiting for its own AI response before moving on. So the system never produces more concurrent AI calls than there are RPG workers. You don't need a separate rate-limiter for that ceiling — it's structural.
 
@@ -246,7 +246,7 @@ Six architectural choices that this chapter quietly commits to:
 
 1. **PHP runs on the IBM i in PASE**, not on a separate Linux box. The integration cost of a separate server isn't worth it when PHP runs natively on the platform.
 2. **The PHP worker is shared across all customers**, not installed per-customer. Configuration varies by customer; code does not.
-3. **The AI worker is a separate application from your existing API** (Replenish R7 in our case). Different lifecycle, different invocation surface, different dependency churn.
+3. **The AI worker is a separate application from your existing API** (R7 in our case). Different lifecycle, different invocation surface, different dependency churn.
 4. **Data queues are the language boundary**, not direct calls or HTTP. Asynchronous, durable, native to IBM i, and they decouple lifecycles cleanly.
 5. **Long-lived workers on both sides**, not spawn-per-request. Startup costs would dominate at any meaningful volume.
 6. **Business logic stays in RPG.** Transport stays in PHP. The boundary is the architecture.

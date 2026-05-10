@@ -7,7 +7,7 @@ has_children: false
 # The data queue contract
 {: .no_toc }
 
-**Status:** Draft V2
+**Status:** Draft V3
 
 The architecture chapter described two halves of a system separated by a queue. This chapter pins down the exact shape of every message that crosses the boundary. Once it's settled, both sides can be built independently — the RPG side is written to produce and consume the formats specified here; the PHP worker is written against the same specification; neither side needs to read the other's code to get integration right.
 
@@ -391,26 +391,86 @@ Worth deciding for a real shop: which option fits K3S conventions best — RPLY_
 
 ---
 
-## Maximum message size
+## Choosing direct payload vs prompt-by-reference
 
-V1 limit: 64 KB (the `MAXLEN(64512)` on the queue).
+V1 supports two patterns for getting the prompt to PHP:
 
-For the demo, every message is 500-1500 bytes. For production purchasing prompts, expect 5-30 KB depending on how much vendor history and policy text is included. Still well under the limit.
+**Direct payload** (the demo's pattern). Put the prompt inside the JSON message on the queue. Up to 64 KB total per message (the `MAXLEN(64512)` ceiling).
 
-If a prompt approaches the limit, switch to **prompt-by-reference**:
+**Prompt-by-reference**. Store the prompt in a DB2 CLOB table keyed by request_id. Send only `{"request_id": "...", "prompt_ref": "DEMOLIB.PROMPTS.123"}` on the queue. PHP fetches the prompt from DB2, calls AI, sends the response back through the queue normally.
 
-1. Store the actual prompt in a DB2 CLOB table keyed by request_id.
-2. Send `{"request_id": "...", "prompt_ref": "DEMOLIB.PROMPTS.123"}` on the queue.
-3. PHP fetches the prompt from DB2 using the reference, then makes the AI call.
-4. PHP sends the response back through the queue normally.
+Pick deliberately, not by accident.
 
-Adds a DB lookup per call but removes the size ceiling. Worth implementing if and when prompts approach 64 KB. Not in V1.
+### When to use direct payload
+
+- Prompt sizes are reliably small (under ~10 KB, with predictable variance).
+- You want fewer moving parts. Direct payload is simpler to reason about — one round trip, one piece of state.
+- Throughput matters and you want to skip the extra DB read per call.
+
+For the demos in this guide, and for many real production workloads, direct payload is the right choice.
+
+### When to use prompt-by-reference
+
+- Prompts vary widely in size, including outliers approaching or exceeding 30-40 KB. Direct payload risks hitting the 64 KB queue limit unpredictably.
+- Prompts are reused (e.g., one prompt template referenced by 1,000 row-specific calls). Storing once and referencing is cheaper than transmitting 1,000 copies.
+- You want prompts to be auditable separately from the queue messages — the CLOB table becomes a permanent record.
+- You want prompts to be human-inspectable in DB2 with `STRSQL` for debugging.
+
+For purchasing-exception prompts that include vendor history, policy text, and seasonality data, the size variance can be significant. Prompt-by-reference is the safer production-default choice for this category.
+
+### What it looks like
+
+Add a CLOB table per customer:
+
+```sql
+CREATE TABLE ACME_5DTA.AI_PROMPTS (
+    REQUEST_ID    VARCHAR(36)   NOT NULL PRIMARY KEY,
+    PROMPT_TEXT   CLOB(1M)      NOT NULL CCSID 1208,
+    CREATED_AT    TIMESTAMP     NOT NULL DEFAULT CURRENT TIMESTAMP
+);
+```
+
+RPG, before sending to AIOUTQ:
+
+```rpg
+// Insert prompt into CLOB table
+exec sql 
+  insert into ACME_5DTA.AI_PROMPTS (REQUEST_ID, PROMPT_TEXT)
+  values (:requestId, :prompt);
+
+// Build request with reference instead of inline prompt
+request.prompt_ref = 'ACME_5DTA.AI_PROMPTS.' + requestId;
+// (omit request.prompt entirely)
+```
+
+PHP, when receiving the request:
+
+```php
+if (isset($request['prompt_ref'])) {
+    $request['prompt'] = $this->fetchPromptByRef($request['prompt_ref']);
+}
+// Continue normally — request['prompt'] now contains the full text
+```
+
+### Cleanup
+
+Prompts in the CLOB table accumulate. For demo and short-lived workloads, leave them — they're useful for debugging. For production, run a daily cleanup that deletes rows older than your audit-retention policy (30 days, 90 days, whatever fits).
+
+---
+
+## Maximum message size (direct payload only)
+
+If you're using direct payload, the queue limit is 64 KB per message. Track this. If individual messages start approaching 50 KB, that's a signal to migrate that workload to prompt-by-reference before you start hitting the ceiling unpredictably.
 
 ---
 
 ## Error handling principles
 
-The contract guarantees a reply for every accepted request. Even if everything goes wrong, RPG gets *some* reply with a status code it can act on. This is what lets RPG rely on its `RECEIVE_DATA_QUEUE` call without timeouts and retry logic.
+The contract specifies that the PHP worker is *designed to send* a reply for every accepted request — including when things fail. That's what produces predictable error codes for RPG to handle. But "designed to" is not a guarantee. The PHP process can crash between receive and send. The IBM i can reboot. A bug can throw before the reply gets out the door.
+
+This means **RPG must treat the reply path as best-effort, not certain**. Every RPG receive call should specify a `WAIT_TIME`, and every batch should have a recovery path for rows whose reply never arrives. Mark them `TIMEOUT` and decide whether to retry, mark failed, or flag for review.
+
+The contract gives RPG a clean error model for things the worker handles intentionally. It does not absolve RPG from handling things the worker can't handle, like its own death.
 
 Three cases produce error replies:
 

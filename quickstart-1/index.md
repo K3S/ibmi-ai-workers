@@ -7,13 +7,13 @@ has_children: false
 # Quickstart 1 — One worker, one round trip (RPG + PHP)
 {: .no_toc }
 
-**Status:** Draft V1 — code untested on Calvin yet
+**Status:** Draft V2
 
 This is the same demo as [Quickstart 1 (RPG only)]({% link quickstart-1-rpg/index.md %}), but with PHP added as the delivery layer between RPG and the AI provider. If you haven't read the pure-RPG version and the [Why PHP]({% link why-php/index.md %}) chapter that follows it, do those first — this chapter assumes you've seen the pure-RPG round trip work and have read the case for adding PHP.
 
 The demo achieves the same end result as the pure-RPG version: five rows get processed, the AI verifies five mathematical claims, results land in DB2. What's different is *how* the AI call happens. RPG hands the request to PHP via a data queue; PHP calls Anthropic; PHP sends the response back through another data queue; RPG processes the result. Same logical operation, different transport.
 
-Everything you need is in this chapter. Copy the SQL, CL, RPG, and PHP into source members on your IBM i, compile, configure, and run. The corresponding source files are also in the repo's [`/demo/`](https://github.com/K3S/ibmi-ai-workers/tree/main/demo) folder.
+Everything you need is in this chapter. Copy the SQL, CL, RPG, and PHP into source members on your IBM i, compile, configure, and run.
 
 ## Table of contents
 {: .no_toc .text-delta }
@@ -27,7 +27,7 @@ Everything you need is in this chapter. Copy the SQL, CL, RPG, and PHP into sour
 
 By the end of this chapter you will have:
 
-- Created a library, a table, and a data queue on your IBM i.
+- Created two libraries, a table, and a data queue on your IBM i.
 - Seeded the table with five rows of "is this math correct?" claims.
 - Written and started a PHP worker that listens on the AI request queue, calls Anthropic, and replies.
 - Compiled three RPG programs and one CL program that read the rows, build prompts, send them through the queue, parse the responses, and write results back.
@@ -38,16 +38,22 @@ This is the K3S-style architecture in miniature. The PHP worker here is the same
 
 ## Prerequisites
 
-You should be able to answer "yes" to all eight items in the [Foundations ready check]({% link foundations/index.md %}#ready-check). Specifically:
+You should be able to answer "yes" to all the items in the [Foundations ready check]({% link foundations/index.md %}#ready-check). Specifically:
 
 - IBM i system you can deploy to, with authority to create libraries, tables, queues, and compile programs.
-- PHP 8.1+ runs from QSH with `ext-curl`, `ext-ibm_db2`, and Composer.
+- The SQL data queue services exist on your system (`SEND_DATA_QUEUE_UTF8`, `RECEIVE_DATA_QUEUE`). Verify by running:
+  ```sql
+  SELECT ROUTINE_NAME 
+    FROM QSYS2.SYSROUTINES
+   WHERE ROUTINE_SCHEMA = 'QSYS2'
+     AND ROUTINE_NAME LIKE '%DATA_QUEUE%';
+  ```
+- A PHP version installed with `ext-ibm_db2` and `ext-curl` enabled. See the [Foundations chapter]({% link foundations/index.md %}#php-on-ibm-i--chroots-versions-extensions) for how to verify.
 - Outbound HTTPS to `api.anthropic.com` works from your IBM i.
 - An Anthropic API key.
 - YAJL installed for RPG JSON parsing.
-- Comfortable enough with RPG and CL to compile programs from source.
 
-The demo creates two libraries (`DEMOLIB` and `K3SAI`) and one table (`DEMOLIB/DEMO_INPUT`). Cleanup at the end removes both libraries entirely.
+The demo creates two libraries (`DEMOLIB` and `K3SAI`). Cleanup at the end removes both libraries entirely.
 
 ---
 
@@ -71,7 +77,7 @@ The demo creates two libraries (`DEMOLIB` and `K3SAI`) and one table (`DEMOLIB/D
                             │ JSON message
                             ▼
                 ┌───────────────────────┐
-                │   AI_OUT_QUEUE        │  in K3SAI library
+                │      AIOUTQ           │  in K3SAI library
                 └───────────┬───────────┘
                             │
                             ▼
@@ -91,7 +97,7 @@ The demo creates two libraries (`DEMOLIB` and `K3SAI`) and one table (`DEMOLIB/D
                 └───────────────────────┘
 ```
 
-Compare this to the pure-RPG version: the new piece is the PHP worker in the middle, sitting between RPG and Anthropic. The data queues (`AI_OUT_QUEUE` and `RPLY_*`) are the language boundary. Everything else is structurally similar to what you've already seen.
+Compare this to the pure-RPG version: the new piece is the PHP worker in the middle, sitting between RPG and Anthropic. The data queues (`AIOUTQ` and `RPLY_*`) are the language boundary. Everything else is structurally similar to what you've already seen.
 
 For this V1 demo we're skipping the architecture's separate `WORK_QUEUE` (the queue that distributes work to multiple RPG workers) — we have one worker and it just iterates the table. The [Quickstart 2 chapter]({% link quickstart-2/index.md %}) introduces `WORK_QUEUE` when we go from one worker to five.
 
@@ -133,15 +139,18 @@ LABEL ON TABLE DEMOLIB/DEMO_INPUT IS 'AI Demo Input Rows';
 ```
 CRTDTAQ DTAQ(K3SAI/AIOUTQ) +
         TYPE(*STD) +
-        MAXLEN(2000000) +
+        MAXLEN(64512) +
         SEQ(*FIFO) +
         FORCE(*NO) +
         AUT(*USE) +
-        CCSID(1208) +
         TEXT('K3S AI Worker - inbound request queue')
 ```
 
-`CCSID(1208)` is critical — data queues store bytes, and we're putting UTF-8 JSON on this queue. If the CCSID is wrong, JSON parsing on either end will mysteriously fail on any non-ASCII character.
+A few notes on the parameters:
+
+- `MAXLEN(64512)` is the maximum allowed for a standard data queue (64 KB minus overhead). Plenty for the demo's tiny JSON messages, and adequate for production prompts up to roughly 30 KB. If your real prompts grow larger than that, the architecture has a "prompt-by-reference" pattern (store the prompt in a CLOB table, send only the reference on the queue) — see the [contract chapter]({% link contract/index.md %}) for details.
+- `SEQ(*FIFO)` means messages come out in the order they went in. Important for fair distribution.
+- We don't set `CCSID` on the queue itself — data queues store raw bytes. UTF-8 handling happens at the *send* and *receive* boundary, via the `_UTF8` variants of the SQL procedures. See [Foundations]({% link foundations/index.md %}#a-note-on-utf-8) for why this matters.
 
 We're not creating the reply queue yet. The RPG worker creates and destroys its own reply queue at job start and end.
 
@@ -164,12 +173,12 @@ VALUES
 
 The PHP worker is a CLI script that runs continuously. It listens on `K3SAI/AIOUTQ`, pulls each request as it arrives, calls Anthropic, and sends the response to whatever reply queue the request named.
 
-We'll set it up in `/home/yourprofile/aidemo/`. Adjust the path to suit your system.
+We'll set it up in `/opt/k3s/ai-worker/`. Adjust the path to suit your shop, but somewhere under `/opt/` is the conventional Unix location for vendor-installed services.
 
 ### Directory structure
 
 ```
-/home/yourprofile/aidemo/
+/opt/k3s/ai-worker/
 ├── composer.json
 ├── worker.php
 └── vendor/         (created by composer install)
@@ -183,13 +192,15 @@ We'll set it up in `/home/yourprofile/aidemo/`. Adjust the path to suit your sys
     "description": "Demo PHP worker for the IBM i AI Workers guide",
     "license": "MIT",
     "require": {
-        "php": ">=8.1",
+        "php": ">=7.4",
         "guzzlehttp/guzzle": "^7.8"
     }
 }
 ```
 
 Just one dependency: Guzzle for HTTPS. Data queue access goes through `ibm_db2` (PHP extension, not a Composer package) using IBM i SQL services.
+
+We list `php >= 7.4` in the requirements because that's the floor where Guzzle 7.x supports it. Production should use a more recent PHP (8.3+), but the demo runs on whatever you have set up. See [Foundations]({% link foundations/index.md %}#php-on-ibm-i--chroots-versions-extensions) for the IBM i PHP version reality.
 
 ### `worker.php`
 
@@ -252,23 +263,35 @@ while (true) {
 
 function receiveRequest($conn, string $lib, string $name): ?array
 {
-    $sql = "SELECT MESSAGE_DATA FROM TABLE(QSYS2.RECEIVE_DATA_QUEUE(
+    // Use MESSAGE_DATA_UTF8 to get UTF-8 bytes regardless of job CCSID.
+    // Parameter is REMOVE (not REMOVE_MESSAGE), and order matters.
+    $sql = "SELECT MESSAGE_DATA_UTF8 
+              FROM TABLE(QSYS2.RECEIVE_DATA_QUEUE(
                 DATA_QUEUE         => ?,
                 DATA_QUEUE_LIBRARY => ?,
-                WAIT_TIME          => 30,
-                REMOVE_MESSAGE     => 'YES'
-            ))";
+                REMOVE             => 'YES',
+                WAIT_TIME          => 30
+              ))";
 
     $stmt = db2_prepare($conn, $sql);
-    db2_execute($stmt, [$name, $lib]);
+    if (!$stmt) {
+        echo "[worker] Prepare failed: " . db2_stmt_errormsg() . "\n";
+        return null;
+    }
+
+    if (!db2_execute($stmt, [$name, $lib])) {
+        echo "[worker] Execute failed: " . db2_stmt_errormsg() . "\n";
+        return null;
+    }
+
     $row = db2_fetch_assoc($stmt);
 
-    if (!$row || empty($row['MESSAGE_DATA'])) {
+    if (!$row || empty($row['MESSAGE_DATA_UTF8'])) {
         return null;
     }
 
     try {
-        return json_decode($row['MESSAGE_DATA'], true, 512, JSON_THROW_ON_ERROR);
+        return json_decode($row['MESSAGE_DATA_UTF8'], true, 512, JSON_THROW_ON_ERROR);
     } catch (JsonException $e) {
         echo "[worker] Bad JSON received: " . $e->getMessage() . "\n";
         return null;
@@ -317,7 +340,9 @@ function callAi(Client $http, string $defaultModel, array $request): array
 
 function sendReply($conn, array $replyQueue, array $reply): void
 {
-    $sql = "CALL QSYS2.SEND_DATA_QUEUE(
+    // Use SEND_DATA_QUEUE_UTF8 so RPG can read it cleanly regardless of job CCSID.
+    // Parameter order: MESSAGE_DATA, DATA_QUEUE, DATA_QUEUE_LIBRARY.
+    $sql = "CALL QSYS2.SEND_DATA_QUEUE_UTF8(
                 MESSAGE_DATA       => ?,
                 DATA_QUEUE         => ?,
                 DATA_QUEUE_LIBRARY => ?
@@ -333,18 +358,24 @@ function sendReply($conn, array $replyQueue, array $reply): void
 
 What's worth noticing:
 
-The data queue access uses SQL services — `QSYS2.RECEIVE_DATA_QUEUE` and `QSYS2.SEND_DATA_QUEUE`. PHP just talks DB2; DB2 talks to the queues.
+**Receive uses `MESSAGE_DATA_UTF8`, not `MESSAGE_DATA`.** The default `MESSAGE_DATA` column comes back in the connection's CCSID (typically EBCDIC). The `_UTF8` column gives us the message converted to UTF-8 — what PHP and our JSON expect.
 
-The `WAIT_TIME => 30` makes PHP block for up to 30 seconds waiting for a message. If nothing arrives, it returns empty and we loop. The worker doesn't burn CPU when idle.
+**Send uses `SEND_DATA_QUEUE_UTF8`, not `SEND_DATA_QUEUE`.** Same reason in reverse. Our `json_encode` produces UTF-8 bytes; we explicitly tell IBM i to store them as UTF-8 so RPG can read them back cleanly.
 
-Error handling is minimal — a Guzzle exception becomes a `PROVIDER_ERROR` reply. Production handles 429s with retry, validates request fields, logs structured data.
+**Parameter is `REMOVE` not `REMOVE_MESSAGE`.** The friendlier name `REMOVE_MESSAGE` exists in some IBM i documentation but the actual parameter your function accepts is `REMOVE`. Worth using named arguments so the order doesn't matter.
+
+**`WAIT_TIME => 30` makes PHP block for up to 30 seconds.** During the wait, PHP uses zero CPU — IBM i's data queue mechanism handles the suspend/wakeup at the OS level. The instant a message arrives, PHP wakes up and gets it.
+
+**Error handling is minimal.** A Guzzle exception becomes a `PROVIDER_ERROR` reply. Production handles 429s with retry, validates request fields, logs structured data.
 
 The reply structure exactly matches the [V1 contract]({% link contract/index.md %}).
 
 ### Install dependencies
 
 ```
-cd /home/yourprofile/aidemo
+mkdir -p /opt/k3s/ai-worker
+cd /opt/k3s/ai-worker
+# Save composer.json and worker.php here
 composer install
 ```
 
@@ -377,7 +408,7 @@ Three RPG programs and one CL program. Compile each into `DEMOLIB`.
 
 ### `DEMOPRE` — pre-AI logic
 
-Same as the pure-RPG version. Reads a row, builds the prompt.
+Reads a row, builds the prompt.
 
 ```rpg
 **FREE
@@ -413,7 +444,7 @@ end-proc;
 
 ### `DEMOPST` — post-AI logic
 
-Different from the pure-RPG version because the response shape is different. Here the response is the V1 contract envelope (PHP wrapped Anthropic's response in our standard format), so we parse the envelope first, then the AI's inner JSON.
+Takes the row ID and the JSON response from PHP. Parses the contract envelope, then parses the AI's inner JSON, then updates the row.
 
 ```rpg
 **FREE
@@ -421,8 +452,8 @@ ctl-opt nomain;
 
 dcl-proc DEMOPST export;
   dcl-pi *n;
-    inRowId       int(10)        const;
-    inResponseJson varchar(4000) const;
+    inRowId        int(10)        const;
+    inResponseJson varchar(4000)  const;
   end-pi;
 
   dcl-ds reply qualified;
@@ -436,10 +467,9 @@ dcl-proc DEMOPST export;
     actual_sum int(10);
   end-ds;
 
-  dcl-s verdict char(1);
+  dcl-s verdict     char(1);
   dcl-s rawResponse varchar(2000);
 
-  // Parse the outer reply (PHP -> RPG envelope)
   data-into reply %data(inResponseJson) %parser('YAJL/YAJLINTO');
 
   if reply.status <> 'success';
@@ -453,7 +483,6 @@ dcl-proc DEMOPST export;
     return;
   endif;
 
-  // Parse the AI's inner JSON response
   monitor;
     data-into aiResult %data(reply.response) %parser('YAJL/YAJLINTO');
   on-error;
@@ -490,7 +519,7 @@ Notice this version is *simpler* than the pure-RPG version. PHP did the work of 
 
 ### `DEMOWRK` — the worker
 
-The orchestrator. Loops over unprocessed rows, calls `DEMOPRE`, sends to AI_OUT_QUEUE, waits for reply, calls `DEMOPST`. Creates and tears down its own reply queue.
+The orchestrator. Loops over unprocessed rows, calls `DEMOPRE`, sends to AIOUTQ, waits for reply, calls `DEMOPST`. Creates and tears down its own reply queue.
 
 ```rpg
 **FREE
@@ -513,8 +542,8 @@ end-pr;
 
 dcl-s rowId       int(10);
 dcl-s prompt      varchar(2000);
-dcl-s requestJson varchar(4000);
-dcl-s responseJson varchar(4000);
+dcl-s requestJson varchar(4000) ccsid(*utf8);
+dcl-s responseJson varchar(4000) ccsid(*utf8);
 dcl-s requestId   varchar(36);
 dcl-s replyQueue  char(10) inz('RPLY_000001');
 dcl-s replyLib    char(10) inz('DEMOLIB');
@@ -539,8 +568,8 @@ dcl-ds request qualified;
 end-ds;
 
 QCMDEXC('CRTDTAQ DTAQ(DEMOLIB/RPLY_000001) +
-         TYPE(*STD) MAXLEN(2000000) +
-         SEQ(*FIFO) CCSID(1208) +
+         TYPE(*STD) MAXLEN(64512) +
+         SEQ(*FIFO) +
          AUT(*USE) +
          TEXT(''Demo reply queue worker 1'')' : 200);
 
@@ -581,21 +610,24 @@ dou eof;
            %data(requestJson : 'noprefix=request_') 
            %gen('YAJL/YAJLDTAGEN');
 
+  // Send via UTF-8 procedure so PHP gets clean UTF-8 bytes.
   exec sql 
-    call qsys2.send_data_queue(
+    call qsys2.send_data_queue_utf8(
       MESSAGE_DATA       => :requestJson,
       DATA_QUEUE         => 'AIOUTQ',
       DATA_QUEUE_LIBRARY => 'K3SAI'
     );
 
+  // Receive UTF-8 column so we get clean text from PHP.
+  // Parameter REMOVE (not REMOVE_MESSAGE).
   exec sql 
-    select MESSAGE_DATA 
+    select MESSAGE_DATA_UTF8 
       into :responseJson
       from table(qsys2.receive_data_queue(
         DATA_QUEUE         => :replyQueue,
         DATA_QUEUE_LIBRARY => :replyLib,
-        WAIT_TIME          => 60,
-        REMOVE_MESSAGE     => 'YES'
+        REMOVE             => 'YES',
+        WAIT_TIME          => 60
       ));
 
   if sqlcode = 0 and responseJson <> '';
@@ -619,7 +651,17 @@ QCMDEXC('DLTDTAQ DTAQ(DEMOLIB/RPLY_000001)' : 36);
 return;
 ```
 
-Compare to the pure-RPG `DEMOWRK`: this version doesn't call AICALL directly. Instead it builds a JSON request, sends it to a queue, and waits for the response. The HTTP work has moved to PHP.
+A few things to notice:
+
+The reply queue creation uses `MAXLEN(64512)` — the maximum allowed for a standard data queue. No `CCSID` parameter on `CRTDTAQ` (it doesn't exist).
+
+Variables holding queue payloads are declared with `ccsid(*utf8)` so RPG handles the UTF-8 conversion natively when binding to SQL.
+
+The send call uses `qsys2.send_data_queue_utf8` — the UTF-8 variant.
+
+The receive selects `MESSAGE_DATA_UTF8` — the UTF-8 column.
+
+The receive parameter is `REMOVE` (not `REMOVE_MESSAGE`).
 
 ### `DEMOSTART` — the entry point
 
@@ -637,7 +679,7 @@ SNDPGMMSG MSG('Demo worker submitted as DEMOWRK1.')
 ENDPGM
 ```
 
-Note `INLLIBL` includes both `DEMOLIB` and `K3SAI` so the worker can reach the AI_OUT_QUEUE.
+Note `INLLIBL` includes both `DEMOLIB` and `K3SAI` so the worker can reach the AIOUTQ.
 
 ### Compile
 
@@ -664,7 +706,7 @@ You need two terminals open:
 **Terminal A — QSH, PHP worker:**
 
 ```
-cd /home/yourprofile/aidemo
+cd /opt/k3s/ai-worker
 export ANTHROPIC_API_KEY="sk-ant-..."
 php worker.php
 ```
@@ -752,13 +794,19 @@ DLTLIB LIB(K3SAI)
 
 Stop the PHP worker with Ctrl-C.
 
+Remove the IFS code:
+
+```
+rm -rf /opt/k3s/ai-worker
+```
+
+(Or just leave it — it's harmless without the libraries.)
+
 ---
 
-## What's deliberately not in this V1 demo
+## What's deliberately not in this V2 demo
 
-Same list as the pure-RPG version, plus:
-
-- **Production-shape PHP worker code.** The PHP we're running is ~130 lines. The production version is structured into classes (Provider, ProfileResolver, Logger, etc.). See [The PHP worker]({% link php-worker/index.md %}) for the production shape.
+- **Production-shape PHP worker code.** The PHP we're running is ~150 lines. The production version is structured into classes (Provider, ProfileResolver, Logger, etc.). See [The PHP worker]({% link php-worker/index.md %}) for the production shape.
 - **Full V1 contract validation.** The PHP worker assumes well-formed requests. Production validates aggressively.
 - **AI profile resolution.** Provider, model, and key are hardcoded. Production looks them up per `profile_ref`.
 

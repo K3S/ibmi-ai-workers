@@ -1,13 +1,13 @@
 ---
 title: The RPG worker pool
-nav_order: 11
+nav_order: 8
 has_children: false
 ---
 
 # The RPG worker pool
 {: .no_toc }
 
-**Status:** Draft V1
+**Status:** Draft V2 V2
 
 The RPG worker pool is where K3S's domain logic lives. It's also where most of the production lines of code in this architecture end up — the PHP worker is small by design, but the RPG side has all the business rules, all the DB2 access, and all the orchestration. This chapter covers the production-shape patterns: how the batch initiator works, how worker jobs are sized and submitted, how they coordinate, how they fail, and how they recover.
 
@@ -159,8 +159,8 @@ dou eofUnits;
   data-gen workUnit %data(workMessage : 'noprefix=workUnit_') 
                     %gen('YAJL/YAJLDTAGEN');
 
-  // Send to WORK_QUEUE
-  exec sql call qsys2.send_data_queue(
+  // Send to WORK_QUEUE — UTF-8 variant so PHP can read JSON cleanly
+  exec sql call qsys2.send_data_queue_utf8(
     MESSAGE_DATA       => :workMessage,
     DATA_QUEUE         => 'WORK_QUEUE',
     DATA_QUEUE_LIBRARY => :customerLib
@@ -275,7 +275,7 @@ dcl-proc processRow;
   data-gen request %data(requestJson : 'noprefix=request_') 
                    %gen('YAJL/YAJLDTAGEN');
 
-  exec sql call qsys2.send_data_queue(
+  exec sql call qsys2.send_data_queue_utf8(
     MESSAGE_DATA       => :requestJson,
     DATA_QUEUE         => 'AIOUTQ',
     DATA_QUEUE_LIBRARY => 'K3SAI'

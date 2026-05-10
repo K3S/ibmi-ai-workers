@@ -1,13 +1,13 @@
 ---
 title: The PHP worker
-nav_order: 10
+nav_order: 7
 has_children: false
 ---
 
 # The PHP worker
 {: .no_toc }
 
-**Status:** Draft V1
+**Status:** Draft V2 V2
 
 The PHP worker is the smallest part of this architecture, by design. It pulls a request off a data queue, calls an AI provider, sends a reply to another data queue, and goes back to waiting. That's it. Everything that makes the production worker more interesting than the demo is layered onto that core: configuration, profile resolution, retry middleware, logging, lifecycle management. None of those layers change what the worker fundamentally is.
 
@@ -23,7 +23,7 @@ This chapter walks through the production-shape worker, explaining what each lay
 
 ## What the worker is
 
-A long-lived PHP CLI process. One per "slot" of AI throughput you want to provide. Started by an autostart job at IPL or by a script after a planned restart; runs until killed. No HTTP server, no Apache, no FastCGI. Just `php /www/k3s-ai-worker/bin/worker.php` running in PASE.
+A long-lived PHP CLI process. One per "slot" of AI throughput you want to provide. Started by an autostart job at IPL or by a script after a planned restart; runs until killed. No HTTP server, no Apache, no FastCGI. Just `php /opt/k3s/ai-worker/bin/worker.php` running in PASE.
 
 What it does, in a loop:
 
@@ -51,10 +51,10 @@ The worker is replaceable, restartable, and shareable. Three properties that eme
 
 ## Project structure
 
-The worker lives in `/www/k3s-ai-worker/` on the IBM i. One installation, shared by all customers.
+The worker lives in `/opt/k3s/ai-worker/` on the IBM i. One installation, shared by all customers.
 
 ```
-/www/k3s-ai-worker/
+/opt/k3s/ai-worker/
 ├── bin/
 │   └── worker.php              # Entry point
 ├── src/
@@ -518,7 +518,7 @@ CRTJOBD JOBD(K3SAI/AIWRKJOBD)
         RQSDTA('CALL PGM(K3SAI/AIWSTART)')
 ```
 
-`AIWSTART.CLLE` is a tiny CL program that launches `php /www/k3s-ai-worker/bin/worker.php` from PASE. It's the same as starting it manually from QSH, just packaged so the subsystem can do it.
+`AIWSTART.CLLE` is a tiny CL program that launches `php /opt/k3s/ai-worker/bin/worker.php` from PASE. It's the same as starting it manually from QSH, just packaged so the subsystem can do it.
 
 The subsystem description tells IBM i how many workers to start and in which pool:
 

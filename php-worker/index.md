@@ -7,7 +7,7 @@ has_children: false
 # The PHP worker
 {: .no_toc }
 
-**Status:** Draft V2 V2
+**Status:** Draft V3 V2
 
 The PHP worker is the smallest part of this architecture, by design. It pulls a request off a data queue, calls an AI provider, sends a reply to another data queue, and goes back to waiting. That's it. Everything that makes the production worker more interesting than the demo is layered onto that core: configuration, profile resolution, retry middleware, logging, lifecycle management. None of those layers change what the worker fundamentally is.
 
@@ -207,7 +207,9 @@ A few things worth noticing:
 
 The main loop has three states: receive, process, repeat. There's no other branching at the top level. Everything sophisticated is delegated to the helper classes.
 
-The `processMessage` method always sends *some* reply. Even when things go wrong — bad JSON, unknown profile, provider timeout — the requesting RPG worker gets a structured error reply and can move on. The contract guarantees a reply for every accepted request, and the worker enforces that here.
+The `processMessage` method is designed to always send *some* reply. Even when things go wrong — bad JSON, unknown profile, provider timeout — the requesting RPG worker gets a structured error reply and can move on. The worker enforces this here.
+
+That said: "designed to" is not "guaranteed." The PHP process can crash between receiving and replying. The IBM i can reboot mid-request. A bug can throw before reaching the send call. Any of these leave RPG waiting on a reply that never arrives. **RPG must always set a `WAIT_TIME` on its receive call and have a recovery path for timeouts** — typically marking the row as `TIMEOUT` and either retrying it later or flagging it for review. The contract is the worker's commitment, not a guarantee against process failure.
 
 The exception types are domain-specific. Each maps cleanly to one of the V1 contract's error codes. This is what lets the worker translate provider-specific failures into a stable API.
 
@@ -555,7 +557,7 @@ You add a worker by adding another autostart job entry and restarting the subsys
 
 How many workers should you have? The answer is governed by three constraints:
 
-1. **AI rate limit.** Whatever your provider's RPM/TPM limit is, divided by per-worker throughput. If Anthropic gives you 4000 RPM and a worker can handle 30 concurrent requests via Guzzle's pool with ~1s latency each, that's 1800 RPM per worker — so two workers saturate the budget. Three is wasted.
+1. **AI rate limit.** Whatever your provider's RPM/TPM limit is, divided by per-worker throughput. If Anthropic gives you 4000 RPM and a worker can handle 10-12 concurrent requests via Guzzle's pool with ~1s latency each, that's roughly 600-720 RPM per worker — so 6-7 workers saturate the budget. Anything past that is wasted. (If you've measured and increased pool_size to 30+, recompute accordingly.)
 2. **IBM i resource budget.** Each worker is ~50 MB resident plus its DB2 connection. Multiple workers compete for memory pool and CPU. Run more workers than your subsystem can host and you'll see queueing.
 3. **Variance smoothing.** One worker is a single point of failure. Two is the minimum for HA. Beyond that, more workers smooth out latency variance — when one is mid-call, others are picking up new work.
 

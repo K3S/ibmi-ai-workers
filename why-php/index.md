@@ -75,6 +75,8 @@ That's not a problem for moderate scale. 20 workers, 50 workers — your IBM i h
 
 A PHP worker using Guzzle's connection pool can hold 30+ HTTP calls in flight from a single process. Five PHP workers handle 150 in-flight calls; eight handle 240. The IBM i sees five or eight jobs, not 150 or 240.
 
+(In practice, we recommend starting with a pool size of 10-12 per worker and scaling up after measurement shows the pool is the bottleneck, not the AI provider's rate limit. The 30+ number is a ceiling on what's achievable, not the recommended starting point. See [Architecture overview]({% link architecture/index.md %}#sizing-the-system) for the full sizing math.)
+
 The math:
 
 | | Pure RPG (1 call per worker) | RPG + PHP (30 calls per PHP worker) |
@@ -85,7 +87,7 @@ The math:
 
 (The "RPG jobs" in the PHP column are smaller — they're waiting on a queue reply, not holding HTTPS connections, so they're lighter.)
 
-For K3S targeting large scale (potentially thousands of concurrent users), the IBM i resource budget for "AI workers" gets uncomfortably large in pure RPG. PHP keeps the footprint small.
+For K3S targeting platform scale (potentially thousands of concurrent users across many customers), the IBM i resource budget for "AI workers" gets uncomfortably large in pure RPG. PHP keeps the footprint small.
 
 ### 3. Provider variability becomes harder to manage
 
@@ -143,7 +145,7 @@ A list of capabilities the PHP layer adds that pure RPG doesn't provide naturall
 
 **1. Connection pooling.** Guzzle keeps TLS connections open across requests. Eliminates per-call handshake cost.
 
-**2. Async fan-out per process.** One PHP process can have 30+ HTTP calls in flight via `GuzzleHttp\Pool`. Each call is independent; the process services whichever responds first. RPG's per-job model can't do this.
+**2. Async fan-out per process.** One PHP process can have many HTTP calls in flight via `GuzzleHttp\Pool` — typically 10-12 to start, with room to scale to 30+ after measurement. Each call is independent; the process services whichever responds first. RPG's per-job model can't do this.
 
 **3. Provider abstraction.** A `ProviderInterface` with implementations for Anthropic, OpenAI, Ollama, and future providers. Adding a new provider is one new class, not changes scattered through worker code.
 
@@ -227,7 +229,7 @@ We considered staying pure RPG. The argument was strong: our team is RPG-fluent,
 
 What pushed us toward PHP:
 
-**1. Potential scale.** A store pilot growing toward 10,000 customers changes the throughput conversation entirely. Pure RPG at peak load would mean hundreds of concurrent IBM i jobs just for AI, on top of the night batch processing window we're already managing.
+**1. Our largest opportunity's potential scale.** A small initial pilot growing toward tens of thousands of stores changes the throughput conversation entirely. Pure RPG at peak load would mean hundreds of concurrent IBM i jobs just for AI, on top of the night batch processing window we're already managing.
 
 **2. Multi-tenancy is core to what K3S does.** We're an ISV serving many distributors concurrently. The provider abstraction, BYOK key custody, and per-customer rate-limit fairness aren't theoretical concerns for us — they're table stakes.
 
